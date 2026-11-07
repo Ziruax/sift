@@ -1,0 +1,41 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Every radar signal the scanner fires, kept so the opportunity log and the
+// outcome stats survive restarts and closed tabs.
+model Signal {
+  id        String   @id // deterministic "<pair>:<type>:<epochMinute>"
+  pair      String
+  base      String
+  type      String // pump_start | volume_lead | buyer_pressure | seller_pressure | dump_start | spike_collapse
+  direction String // long | short — how the outcome is graded
+  score     Int
+  price     Float
+  change24h Float
+  rvol      Float
+  buyPct    Float
+  volume24h Float
+  note      String?
+  createdAt DateTime @default(now())
+
+  // Outcome fields, filled as the signal matures (5m / 15m / 60m later).
+  price5m   Float?
+  change5m  Float?
+  price15m  Float?
+  change15m Float?
+  price60m  Float?
+  change60m Float?
+  mfe       Float? // max favorable excursion % within the first hour
+  mae       Float? // max adverse excursion % within the first hour
+  status    String   @default("pending") // pending | partial | final
+
+  @@index([createdAt])
+  @@index([type])
+  @@index([pair])
+}

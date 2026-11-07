@@ -1,0 +1,763 @@
+     1→     1→import { useQuery } from "@tanstack/react-query";
+     2→     2→import { Link, useRouter } from "@tanstack/react-router";
+     3→     3→import { RefreshCw, Search, Star } from "lucide-react";
+     4→     4→import { useEffect, useMemo, useState, type ReactNode } from "react";
+     5→     5→import { Shell } from "@/components/shell";
+     6→     6→import { cn } from "@/lib/cn";
+     7→     7→import {
+     8→     8→  changeOf,
+     9→     9→  formatCompact,
+    10→    10→  formatPct,
+    11→    11→  formatPrice,
+    12→    12→  signalFor,
+    13→    13→  signalHint,
+    14→    14→  signalLabel,
+    15→    15→  windowLabel,
+    16→    16→  windowShort,
+    17→    17→} from "@/lib/crypto/format";
+    18→    18→import { getBoard, getSaved, searchCoins } from "@/lib/crypto/server";
+    19→    19→import {
+    20→    20→  getRadar,
+    21→    21→  RADAR_ALERT_MIN_SCORE,
+    22→    22→  RADAR_ALERT_MIN_VOLUME_24H,
+    23→    23→  radarSignalLabel,
+    24→    24→  signalOf,
+    25→    25→  type RadarBadge,
+    26→    26→  type RadarRow,
+    27→    27→  type RadarSignal,
+    28→    28→} from "@/lib/crypto/radar";
+    29→    29→import type { Board, BookKey, Coin, Signal, WindowKey } from "@/lib/crypto/types";
+    30→    30→import { useWatchlist } from "@/lib/watchlist";
+    31→    31→
+    32→    32→type TabId = "markets" | "rising" | "falling" | "radar" | "saved";
+    33→    33→type MoverKind = "all" | Signal;
+    34→    34→
+    35→    35→const windows: WindowKey[] = ["15m", "30m", "1h"];
+    36→    36→
+    37→    37→function useDebounced(value: string, delay: number) {
+    38→    38→  const [debounced, setDebounced] = useState(value);
+    39→    39→  useEffect(() => {
+    40→    40→    const id = window.setTimeout(() => setDebounced(value), delay);
+    41→    41→    return () => window.clearTimeout(id);
+    42→    42→  }, [value, delay]);
+    43→    43→  return debounced;
+    44→    44→}
+    45→    45→
+    46→    46→function Stat({ label, value, change }: { label: string; value: string; change?: number }) {
+    47→    47→  return (
+    48→    48→    <div className="rounded-2xl border border-line bg-surface px-4 py-3">
+    49→    49→      <p className="text-xs uppercase tracking-widest text-muted">{label}</p>
+    50→    50→      <p className="num mt-1 font-display text-2xl leading-none">{value}</p>
+    51→    51→      {change !== undefined ? (
+    52→    52→        <p className={cn("num mt-1 text-xs", change > 0 ? "text-up" : change < 0 ? "text-down" : "text-muted")}>
+    53→    53→          {formatPct(change)} today
+    54→    54→        </p>
+    55→    55→      ) : null}
+    56→    56→    </div>
+    57→    57→  );
+    58→    58→}
+    59→    59→
+    60→    60→function Pill({
+    61→    61→  active,
+    62→    62→  children,
+    63→    63→  onClick,
+    64→    64→  pressed,
+    65→    65→}: {
+    66→    66→  active: boolean;
+    67→    67→  children: ReactNode;
+    68→    68→  onClick: () => void;
+    69→    69→  pressed?: boolean;
+    70→    70→}) {
+    71→    71→  return (
+    72→    72→    <button
+    73→    73→      type="button"
+    74→    74→      role="tab"
+    75→    75→      aria-selected={pressed ?? active}
+    76→    76→      onClick={onClick}
+    77→    77→      className={cn(
+    78→    78→        "h-11 rounded-full px-4 text-sm font-medium",
+    79→    79→        active ? "bg-ink text-bg" : "border border-line bg-surface text-ink",
+    80→    80→      )}
+    81→    81→    >
+    82→    82→      {children}
+    83→    83→    </button>
+    84→    84→  );
+    85→    85→}
+    86→    86→
+    87→    87→function ChangeText({ value, className }: { value: number; className?: string }) {
+    88→    88→  return (
+    89→    89→    <span className={cn("num", value > 0 ? "text-up" : value < 0 ? "text-down" : "text-muted", className)}>
+    90→    90→      {formatPct(value)}
+    91→    91→    </span>
+    92→    92→  );
+    93→    93→}
+    94→    94→
+    95→    95→function StarButton({ id }: { id: string }) {
+    96→    96→  const ids = useWatchlist((state) => state.ids);
+    97→    97→  const toggle = useWatchlist((state) => state.toggle);
+    98→    98→  const on = ids.includes(id);
+    99→    99→  return (
+   100→   100→    <button
+   101→   101→      type="button"
+   102→   102→      aria-pressed={on}
+   103→   103→      aria-label={on ? "Remove from saved" : "Save coin"}
+   104→   104→      onClick={() => toggle(id)}
+   105→   105→      className="pointer-events-auto grid size-11 place-items-center rounded-full"
+   106→   106→    >
+   107→   107→      <Star className={cn("size-4", on ? "fill-accent text-accent" : "text-muted")} />
+   108→   108→    </button>
+   109→   109→  );
+   110→   110→}
+   111→   111→
+   112→   112→function CoinRow({
+   113→   113→  coin,
+   114→   114→  primary,
+   115→   115→  secondaryLabel,
+   116→   116→  secondary,
+   117→   117→  signal,
+   118→   118→}: {
+   119→   119→  coin: Coin;
+   120→   120→  primary: number;
+   121→   121→  secondaryLabel: string;
+   122→   122→  secondary: number;
+   123→   123→  signal?: Signal;
+   124→   124→}) {
+   125→   125→  return (
+   126→   126→    <li className="relative border-b border-line last:border-b-0">
+   127→   127→      <Link
+   128→   128→        to="/coin/$id"
+   129→   129→        params={{ id: coin.id }}
+   130→   130→        preload="intent"
+   131→   131→        aria-label={`${coin.name}, ${formatPrice(coin.price)}, ${formatPct(primary)}`}
+   132→   132→        className="absolute inset-0 z-0"
+   133→   133→      />
+   134→   134→      <div className="pointer-events-none relative z-10 flex items-center gap-2 py-3 sm:gap-3">
+   135→   135→        <StarButton id={coin.id} />
+   136→   136→        <div className="min-w-0 flex-1">
+   137→   137→          <div className="flex items-baseline gap-2">
+   138→   138→            <span className="font-semibold">{coin.symbol}</span>
+   139→   139→            <span className="truncate text-sm text-muted">{coin.name}</span>
+   140→   140→          </div>
+   141→   141→          <p className="mt-0.5 text-xs text-muted">
+   142→   142→            Rank {coin.rank || "—"} · Vol {formatCompact(coin.volume24h)}
+   143→   143→          </p>
+   144→   144→          <p className="num mt-1 text-sm md:hidden">{formatPrice(coin.price)}</p>
+   145→   145→        </div>
+   146→   146→        <p className="num hidden w-28 text-right md:block">{formatPrice(coin.price)}</p>
+   147→   147→        <div className="w-24 text-right sm:w-28">
+   148→   148→          <ChangeText value={primary} className="text-base font-semibold" />
+   149→   149→          <p className="mt-0.5 text-xs text-muted">
+   150→   150→            {secondaryLabel} <ChangeText value={secondary} />
+   151→   151→          </p>
+   152→   152→        </div>
+   153→   153→        {signal ? (
+   154→   154→          <span
+   155→   155→            title={signalHint[signal]}
+   156→   156→            className={cn(
+   157→   157→              "hidden h-7 items-center rounded-full px-2 text-xs font-medium md:inline-flex",
+   158→   158→              signal === "bounce" && "bg-accent-soft text-accent",
+   159→   159→              signal === "run" && "bg-up-soft text-up",
+   160→   160→              (signal === "fade" || signal === "slide") && "bg-down-soft text-down",
+   161→   161→            )}
+   162→   162→          >
+   163→   163→            {signalLabel[signal]}
+   164→   164→          </span>
+   165→   165→        ) : (
+   166→   166→          <span className="hidden w-16 md:block" />
+   167→   167→        )}
+   168→   168→      </div>
+   169→   169→    </li>
+   170→   170→  );
+   171→   171→}
+   172→   172→
+   173→   173→function LeadCard({ coin, window }: { coin: Coin; window: WindowKey }) {
+   174→   174→  const move = changeOf(coin, window);
+   175→   175→  const signal = signalFor(move, coin.change24h);
+   176→   176→  const up = move >= 0;
+   177→   177→  return (
+   178→   178→    <div className="group relative">
+   179→   179→      <Link
+   180→   180→        to="/coin/$id"
+   181→   181→        params={{ id: coin.id }}
+   182→   182→        preload="intent"
+   183→   183→        aria-label={`${coin.name}, ${formatPct(move)} in the last ${windowLabel[window]}`}
+   184→   184→        className="absolute inset-0 z-0 rounded-2xl"
+   185→   185→      />
+   186→   186→      <div className="pointer-events-none relative z-10 rounded-2xl border border-line bg-surface p-5 transition-colors group-hover:border-ink">
+   187→   187→        <div className="flex items-start justify-between gap-3">
+   188→   188→          <p className="text-xs uppercase tracking-widest text-muted">
+   189→   189→            Fastest {up ? "riser" : "fall"} · last {windowLabel[window]}
+   190→   190→          </p>
+   191→   191→          <StarButton id={coin.id} />
+   192→   192→        </div>
+   193→   193→        <div className="mt-2 flex items-end justify-between gap-4">
+   194→   194→          <div className="min-w-0">
+   195→   195→            <p className="font-display text-4xl leading-none tracking-tight">{coin.symbol}</p>
+   196→   196→            <p className="mt-1 truncate text-muted">{coin.name}</p>
+   197→   197→            <p className="mt-1 text-xs text-muted">
+   198→   198→              Rank {coin.rank || "—"} · Vol {formatCompact(coin.volume24h)} · Cap {formatCompact(coin.marketCap)}
+   199→   199→            </p>
+   200→   200→            <p className="num mt-4 text-lg">{formatPrice(coin.price)}</p>
+   201→   201→          </div>
+   202→   202→          <div className="text-right">
+   203→   203→            <p className={cn("num font-display text-4xl leading-none sm:text-5xl", up ? "text-up" : "text-down")}>
+   204→   204→              {formatPct(move)}
+   205→   205→            </p>
+   206→   206→            <p className="mt-2 text-sm text-muted">
+   207→   207→              24h <ChangeText value={coin.change24h} />
+   208→   208→            </p>
+   209→   209→          </div>
+   210→   210→        </div>
+   211→   211→        <p className="mt-4 max-w-xl text-sm text-muted">{signalHint[signal]}</p>
+   212→   212→      </div>
+   213→   213→    </div>
+   214→   214→  );
+   215→   215→}
+   216→   216→
+   217→   217→const radarBadgeLabel: Record<RadarBadge, string> = {
+   218→   218→  pump: "Pump starting",
+   219→   219→  early: "Early",
+   220→   220→  dumping: "Dumping",
+   221→   221→  pumped: "Pumped — avoid",
+   222→   222→};
+   223→   223→
+   224→   224→function RadarRowView({ row }: { row: RadarRow }) {
+   225→   225→  return (
+   226→   226→    <li className="border-b border-line py-3 last:border-b-0">
+   227→   227→      <div className="flex items-center gap-3">
+   228→   228→        <div className="min-w-0 flex-1">
+   229→   229→          <div className="flex items-baseline gap-2">
+   230→   230→            <span className="font-semibold">{row.symbol}</span>
+   231→   231→            <span className="num text-sm">{formatPrice(row.price)}</span>
+   232→   232→          </div>
+   233→   233→          <p className="mt-0.5 text-xs text-muted">
+   234→   234→            24h <ChangeText value={row.change24h} /> · Vol {formatCompact(row.volume24h)}
+   235→   235→          </p>
+   236→   236→        </div>
+   237→   237→        <div className="shrink-0 text-right">
+   238→   238→          <p className="num text-sm font-semibold">
+   239→   239→            {row.score}
+   240→   240→            <span className="text-muted">/100</span>
+   241→   241→          </p>
+   242→   242→          <span className="mt-1 block h-1.5 w-16 rounded-full bg-bg-deep">
+   243→   243→            <span className="block h-full rounded-full bg-accent" style={{ width: `${row.score}%` }} />
+   244→   244→          </span>
+   245→   245→        </div>
+   246→   246→        {row.badge ? (
+   247→   247→          <span
+   248→   248→            className={cn(
+   249→   249→              "inline-flex h-7 shrink-0 items-center rounded-full px-2 text-xs font-medium",
+   250→   250→              row.badge === "pump" && "bg-up-soft text-up",
+   251→   251→              row.badge === "early" && "bg-accent-soft text-accent",
+   252→   252→              (row.badge === "dumping" || row.badge === "pumped") && "bg-down-soft text-down",
+   253→   253→            )}
+   254→   254→          >
+   255→   255→            {radarBadgeLabel[row.badge]}
+   256→   256→          </span>
+   257→   257→        ) : null}
+   258→   258→      </div>
+   259→   259→      <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted">
+   260→   260→        <span>
+   261→   261→          1m <ChangeText value={row.change1m} />
+   262→   262→        </span>
+   263→   263→        <span>
+   264→   264→          5m <ChangeText value={row.change5m} />
+   265→   265→        </span>
+   266→   266→        <span>
+   267→   267→          15m <ChangeText value={row.change15m} />
+   268→   268→        </span>
+   269→   269→        <span>
+   270→   270→          Vol spike <span className="num text-ink">{row.spike.toFixed(1)}x</span>
+   271→   271→        </span>
+   272→   272→        <span>
+   273→   273→          Buy <span className="num text-ink">{row.buyPct.toFixed(0)}%</span>
+   274→   274→        </span>
+   275→   275→        {row.belowHighPct >= 3 ? (
+   276→   276→          <span className="text-down">−{row.belowHighPct.toFixed(1)}% off session high</span>
+   277→   277→        ) : null}
+   278→   278→        {row.volumeLead ? (
+   279→   279→          <span className="text-accent">Volume leading — flat 2–3 min, price hasn’t moved yet</span>
+   280→   280→        ) : null}
+   281→   281→      </div>
+   282→   282→    </li>
+   283→   283→  );
+   284→   284→}
+   285→   285→
+   286→   286→const radarGroups: RadarSignal[] = ["pumping", "dumping", "long", "short", "flat"];
+   287→   287→
+   288→   288→function RadarPanel() {
+   289→   289→  const [hidePumped, setHidePumped] = useState(true);
+   290→   290→  const [group, setGroup] = useState<RadarSignal | "all">("all");
+   291→   291→  const radar = useQuery({
+   292→   292→    queryKey: ["radar"],
+   293→   293→    queryFn: getRadar,
+   294→   294→    refetchInterval: 5_000,
+   295→   295→  });
+   296→   296→
+   297→   297→  const rows = radar.data?.rows ?? [];
+   298→   298→  const alerts = rows.filter(
+   299→   299→    (row) => row.score >= RADAR_ALERT_MIN_SCORE && row.volume24h > RADAR_ALERT_MIN_VOLUME_24H,
+   300→   300→  );
+   301→   301→  // Group counts are counted after the hide-pumped filter, so the chips
+   302→   302→  // always describe the list you are looking at.
+   303→   303→  const base = hidePumped ? rows.filter((row) => row.change24h <= 8) : rows;
+   304→   304→  const counts = useMemo(() => {
+   305→   305→    const out: Record<RadarSignal, number> = { pumping: 0, dumping: 0, long: 0, short: 0, flat: 0 };
+   306→   306→    for (const row of base) out[signalOf(row)] += 1;
+   307→   307→    return out;
+   308→   308→  }, [base]);
+   309→   309→  const shown = group === "all" ? base : base.filter((row) => signalOf(row) === group);
+   310→   310→  const updated = radar.dataUpdatedAt > 0 ? new Date(radar.dataUpdatedAt) : null;
+   311→   311→
+   312→   312→  return (
+   313→   313→    <div className="mt-4">
+   314→   314→      <p className="max-w-2xl text-sm leading-relaxed text-muted">
+   315→   315→        Volume spikes and early momentum across the top 40 USDT pairs on Binance, refreshed every 5 seconds.
+   316→   316→        Groups are signals, not predictions — “Go long” means buyers dominate a flat coin right now, not that
+   317→   317→        the price will rise. Use it to spot coins that already pumped — and skip them — not to chase pumps.
+   318→   318→      </p>
+   319→   319→      <p className="mt-2 text-xs text-muted" aria-live="polite">
+   320→   320→        <span className="mr-2 inline-block size-1.5 rounded-full bg-up align-middle" aria-hidden="true" />
+   321→   321→        Live · updates every 5s · Binance spot data
+   322→   322→        {updated ? ` · Updated ${updated.toLocaleTimeString("en-GB")}` : ""}
+   323→   323→      </p>
+   324→   324→
+   325→   325→      {alerts.length > 0 ? (
+   326→   326→        <div className="mt-4 rounded-2xl border border-line bg-down-soft px-4 py-3" role="alert">
+   327→   327→          {alerts.map((row) => (
+   328→   328→            <p key={row.pair} className="text-sm font-medium text-down">
+   329→   329→              ⚠️ {row.symbol}: Volume {row.spike.toFixed(1)}x spike, {formatPct(row.change5m)} in 5m, Score{" "}
+   330→   330→              {row.score}/100 — Pump Starting
+   331→   331→            </p>
+   332→   332→          ))}
+   333→   333→        </div>
+   334→   334→      ) : null}
+   335→   335→
+   336→   336→      <div className="mt-4 flex flex-wrap gap-2">
+   337→   337→        <button
+   338→   338→          type="button"
+   339→   339→          aria-pressed={hidePumped}
+   340→   340→          onClick={() => setHidePumped((value) => !value)}
+   341→   341→          className={cn(
+   342→   342→            "h-11 rounded-full px-4 text-sm",
+   343→   343→            hidePumped ? "bg-ink text-bg" : "border border-line bg-surface",
+   344→   344→          )}
+   345→   345→        >
+   346→   346→          Hide already-pumped (24h &gt; +8%)
+   347→   347→        </button>
+   348→   348→      </div>
+   349→   349→
+   350→   350→      <div className="mt-3 flex flex-wrap gap-2" role="group" aria-label="Signal group">
+   351→   351→        <button
+   352→   352→          type="button"
+   353→   353→          aria-pressed={group === "all"}
+   354→   354→          onClick={() => setGroup("all")}
+   355→   355→          className={cn(
+   356→   356→            "h-11 rounded-full px-4 text-sm",
+   357→   357→            group === "all" ? "bg-ink text-bg" : "border border-line bg-surface",
+   358→   358→          )}
+   359→   359→        >
+   360→   360→          All <span className="num ml-1 text-xs opacity-70">{base.length}</span>
+   361→   361→        </button>
+   362→   362→        {radarGroups.map((item) => (
+   363→   363→          <button
+   364→   364→            key={item}
+   365→   365→            type="button"
+   366→   366→            aria-pressed={group === item}
+   367→   367→            onClick={() => setGroup(item)}
+   368→   368→            className={cn(
+   369→   369→              "h-11 rounded-full px-4 text-sm",
+   370→   370→              group === item ? "bg-ink text-bg" : "border border-line bg-surface",
+   371→   371→            )}
+   372→   372→          >
+   373→   373→            {radarSignalLabel[item]}{" "}
+   374→   374→            <span className="num ml-1 text-xs opacity-70">{counts[item]}</span>
+   375→   375→          </button>
+   376→   376→        ))}
+   377→   377→      </div>
+   378→   378→
+   379→   379→      {radar.isError ? (
+   380→   380→        <div className="mt-4 rounded-2xl border border-line bg-surface p-8">
+   381→   381→          <h2 className="font-display text-2xl">The radar didn’t load</h2>
+   382→   382→          <p className="mt-2 text-sm text-muted">
+   383→   383→            {radar.error instanceof Error ? radar.error.message : "Try again."}
+   384→   384→          </p>
+   385→   385→          <button
+   386→   386→            type="button"
+   387→   387→            onClick={() => void radar.refetch()}
+   388→   388→            className="mt-6 h-11 rounded-full bg-ink px-5 text-sm font-medium text-bg"
+   389→   389→          >
+   390→   390→            Try again
+   391→   391→          </button>
+   392→   392→        </div>
+   393→   393→      ) : radar.isPending ? (
+   394→   394→        <p className="px-1 py-8 text-sm text-muted">Scanning Binance for early moves…</p>
+   395→   395→      ) : shown.length === 0 ? (
+   396→   396→        <div className="mt-4 rounded-2xl border border-dashed border-line px-5 py-10 text-center">
+   397→   397→          <p className="font-display text-2xl">No coins in this group right now</p>
+   398→   398→          <p className="mt-2 text-sm text-muted">
+   399→   399→            {group === "all"
+   400→   400→              ? "Nothing is moving. Turn the pumped filter off to see the full scan."
+   401→   401→              : "Try All, or wait for the next 5-second scan."}
+   402→   402→          </p>
+   403→   403→        </div>
+   404→   404→      ) : (
+   405→   405→        <ol className="mt-4 rounded-2xl border border-line bg-surface px-3 sm:px-4">
+   406→   406→          {shown.map((row) => (
+   407→   407→            <RadarRowView key={row.pair} row={row} />
+   408→   408→          ))}
+   409→   409→        </ol>
+   410→   410→      )}
+   411→   411→      <p className="mt-3 text-xs text-muted">
+   412→   412→        Top 40 USDT pairs by 24h volume. “Pumping now” is score ≥ 80 with the 5-minute price up. “Dumping
+   413→   413→        now” is 3%+ below the session high with a volume spike and the price falling. “Go long” is buyers
+   414→   414→        taking 70%+ of volume on a flat coin (24h −5% to +8%, last 1m and 5m within ±1%) with volume rising
+   415→   415→        2x or more — “Go short” is the mirror image, sellers taking 70%+. “Early” means a 3x volume spike
+   416→   416→        while the day is still flat. “Volume leading” means the coin sat flat for 2–3 minutes while volume
+   417→   417→        spiked — the money arrived before any price move.
+   418→   418→      </p>
+   419→   419→    </div>
+   420→   420→  );
+   421→   421→}
+   422→   422→
+   423→   423→export function Board({ initial }: { initial: Board }) {
+   424→   424→  const router = useRouter();
+   425→   425→  const [tab, setTab] = useState<TabId>("rising");
+   426→   426→  const [windowKey, setWindowKey] = useState<WindowKey>(initial.window);
+   427→   427→  const [book, setBook] = useState<BookKey>(initial.book);
+   428→   428→  const [kind, setKind] = useState<MoverKind>("all");
+   429→   429→  const [query, setQuery] = useState("");
+   430→   430→  const [sort, setSort] = useState<"rank" | "change24h" | "change7d" | "volume24h" | "marketCap">("rank");
+   431→   431→  const debounced = useDebounced(query, 220);
+   432→   432→  const savedIds = useWatchlist((state) => state.ids);
+   433→   433→
+   434→   434→  const board = useQuery({
+   435→   435→    queryKey: ["board", windowKey, book],
+   436→   436→    queryFn: () => getBoard({ data: { window: windowKey, book } }),
+   437→   437→    initialData: windowKey === initial.window && book === initial.book ? initial : undefined,
+   438→   438→    initialDataUpdatedAt:
+   439→   439→      windowKey === initial.window && book === initial.book ? Date.parse(initial.updatedAt) : undefined,
+   440→   440→    refetchInterval: 60_000,
+   441→   441→  });
+   442→   442→
+   443→   443→  const saved = useQuery({
+   444→   444→    queryKey: ["saved", savedIds],
+   445→   445→    queryFn: () => getSaved({ data: { ids: savedIds } }),
+   446→   446→    enabled: tab === "saved" && savedIds.length > 0 && debounced.trim().length < 2,
+   447→   447→    refetchInterval: tab === "saved" ? 60_000 : false,
+   448→   448→  });
+   449→   449→
+   450→   450→  const remote = useQuery({
+   451→   451→    queryKey: ["search", debounced],
+   452→   452→    queryFn: () => searchCoins({ data: { q: debounced } }),
+   453→   453→    enabled: debounced.trim().length >= 2,
+   454→   454→  });
+   455→   455→
+   456→   456→  const data = board.data;
+   457→   457→  const shownWindow = data?.window ?? windowKey;
+   458→   458→
+   459→   459→  const searching = debounced.trim().length >= 2;
+   460→   460→
+   461→   461→  const list = useMemo(() => {
+   462→   462→    if (!data) return [] as Coin[];
+   463→   463→    const q = query.trim().toLowerCase();
+   464→   464→    const filterQuery = (rows: Coin[]) => {
+   465→   465→      if (!q || (searching && remote.isFetched && !remote.isError)) return rows;
+   466→   466→      return rows.filter(
+   467→   467→        (coin) => coin.symbol.toLowerCase().includes(q) || coin.name.toLowerCase().includes(q),
+   468→   468→      );
+   469→   469→    };
+   470→   470→
+   471→   471→    if (searching && remote.isFetched && !remote.isError) return remote.data ?? [];
+   472→   472→
+   473→   473→    if (tab === "radar") return [];
+   474→   474→
+   475→   475→    if (tab === "markets") {
+   476→   476→      const rows = [...data.markets];
+   477→   477→      rows.sort((a, b) => {
+   478→   478→        if (sort === "rank") return a.rank - b.rank;
+   479→   479→        return b[sort] - a[sort];
+   480→   480→      });
+   481→   481→      return filterQuery(rows);
+   482→   482→    }
+   483→   483→    if (tab === "saved") return filterQuery(saved.data ?? []);
+   484→   484→    const source = tab === "rising" ? data.rising : data.falling;
+   485→   485→    const filtered =
+   486→   486→      kind === "all"
+   487→   487→        ? source
+   488→   488→        : source.filter((coin) => signalFor(changeOf(coin, shownWindow), coin.change24h) === kind);
+   489→   489→    return filterQuery(filtered);
+   490→   490→  }, [data, kind, query, remote.data, remote.isError, remote.isFetched, saved.data, searching, shownWindow, sort, tab]);
+   491→   491→
+   492→   492→  if (board.isError) {
+   493→   493→    return (
+   494→   494→      <Shell>
+   495→   495→        <div className="rounded-2xl border border-line bg-surface p-8">
+   496→   496→          <h1 className="font-display text-3xl">The tape didn’t load</h1>
+   497→   497→          <p className="mt-2 max-w-lg text-muted">{board.error instanceof Error ? board.error.message : "Try again."}</p>
+   498→   498→          <button
+   499→   499→            type="button"
+   500→   500→            onClick={() => void router.invalidate()}
+   501→   501→            className="mt-6 h-11 rounded-full bg-ink px-5 text-sm font-medium text-bg"
+   502→   502→          >
+   503→   503→            Try again
+   504→   504→          </button>
+   505→   505→        </div>
+   506→   506→      </Shell>
+   507→   507→    );
+   508→   508→  }
+   509→   509→
+   510→   510→  if (!data) {
+   511→   511→    return (
+   512→   512→      <Shell>
+   513→   513→        <p className="font-display text-3xl">Pulling the tape…</p>
+   514→   514→      </Shell>
+   515→   515→    );
+   516→   516→  }
+   517→   517→
+   518→   518→  const moverTab = tab === "rising" || tab === "falling";
+   519→   519→  const lead = !searching && moverTab ? list[0] : undefined;
+   520→   520→  const rows = lead ? list.slice(1) : list;
+   521→   521→  const quiet =
+   522→   522→    moverTab &&
+   523→   523→    !searching &&
+   524→   524→    list.length > 0 &&
+   525→   525→    list.every((coin) => Math.abs(changeOf(coin, shownWindow)) < 0.15);
+   526→   526→
+   527→   527→  const kindOptions: Array<{ id: MoverKind; label: string }> =
+   528→   528→    tab === "falling"
+   529→   529→      ? [
+   530→   530→          { id: "all", label: "All" },
+   531→   531→          { id: "fade", label: "Fades" },
+   532→   532→          { id: "slide", label: "Slides" },
+   533→   533→        ]
+   534→   534→      : [
+   535→   535→          { id: "all", label: "All" },
+   536→   536→          { id: "bounce", label: "Bounces" },
+   537→   537→          { id: "run", label: "Runs" },
+   538→   538→        ];
+   539→   539→
+   540→   540→  return (
+   541→   541→    <Shell updatedAt={data.updatedAt}>
+   542→   542→      <div className="max-w-2xl">
+   543→   543→        <h1 className="font-display text-4xl leading-tight tracking-tight sm:text-5xl">
+   544→   544→          What’s moving before it isn’t.
+   545→   545→        </h1>
+   546→   546→        <p className="mt-3 text-base leading-relaxed text-muted">
+   547→   547→          Rising and falling tabs sort coins by the last few minutes, not by yesterday’s headline. Open one for
+   548→   548→          the full price history.
+   549→   549→        </p>
+   550→   550→      </div>
+   551→   551→
+   552→   552→      <section className="mt-6 grid grid-cols-2 gap-3 lg:grid-cols-4" aria-label="Market snapshot">
+   553→   553→        <Stat label="Market cap" value={formatCompact(data.global.marketCap)} change={data.global.marketCapChange24h} />
+   554→   554→        <Stat label="24h volume" value={formatCompact(data.global.volume24h)} change={data.global.volumeChange24h} />
+   555→   555→        <Stat label="Bitcoin share" value={`${data.global.btcDominance.toFixed(1)}%`} />
+   556→   556→        <Stat label="Coins listed" value={new Intl.NumberFormat("en-US").format(data.global.listed)} />
+   557→   557→      </section>
+   558→   558→
+   559→   559→      <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:items-center">
+   560→   560→        <label className="relative block min-w-0 flex-1">
+   561→   561→          <span className="sr-only">Search coins</span>
+   562→   562→          <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted" />
+   563→   563→          <input
+   564→   564→            value={query}
+   565→   565→            onChange={(event) => setQuery(event.target.value)}
+   566→   566→            placeholder="Search any coin"
+   567→   567→            className="h-11 w-full rounded-full border border-line bg-surface pr-4 pl-10 text-ink outline-none placeholder:text-muted"
+   568→   568→          />
+   569→   569→        </label>
+   570→   570→        <button
+   571→   571→          type="button"
+   572→   572→          onClick={() => void board.refetch()}
+   573→   573→          className="inline-flex h-11 items-center justify-center gap-2 rounded-full border border-line bg-surface px-4 text-sm"
+   574→   574→        >
+   575→   575→          <RefreshCw className={cn("size-4", board.isFetching && "animate-spin")} />
+   576→   576→          Refresh
+   577→   577→        </button>
+   578→   578→      </div>
+   579→   579→
+   580→   580→      <div className="mt-5 flex flex-wrap gap-2" role="tablist" aria-label="Tape">
+   581→   581→        <Pill active={tab === "markets" && !searching} onClick={() => setTab("markets")}>
+   582→   582→          Markets
+   583→   583→        </Pill>
+   584→   584→        <Pill active={tab === "rising" && !searching} onClick={() => setTab("rising")}>
+   585→   585→          Rising
+   586→   586→          {data.risingCount > 0 ? <span className="num ml-2 text-xs opacity-70">{data.risingCount}</span> : null}
+   587→   587→        </Pill>
+   588→   588→        <Pill active={tab === "falling" && !searching} onClick={() => setTab("falling")}>
+   589→   589→          Falling
+   590→   590→          {data.fallingCount > 0 ? <span className="num ml-2 text-xs opacity-70">{data.fallingCount}</span> : null}
+   591→   591→        </Pill>
+   592→   592→        <Pill active={tab === "radar" && !searching} onClick={() => setTab("radar")}>
+   593→   593→          Radar
+   594→   594→        </Pill>
+   595→   595→        <Pill active={tab === "saved" && !searching} onClick={() => setTab("saved")}>
+   596→   596→          Saved
+   597→   597→          {savedIds.length > 0 ? <span className="num ml-2 text-xs opacity-70">{savedIds.length}</span> : null}
+   598→   598→        </Pill>
+   599→   599→      </div>
+   600→   600→
+   601→   601→      {searching ? (
+   602→   602→        <p className="mt-4 text-sm text-muted">
+   603→   603→          {remote.isFetching ? "Searching the full list…" : `${list.length} match${list.length === 1 ? "" : "es"} across listed coins.`}
+   604→   604→        </p>
+   605→   605→      ) : moverTab ? (
+   606→   606→        <div className="mt-4 flex flex-col gap-3">
+   607→   607→          <div className="flex flex-wrap gap-2" role="group" aria-label="Time window">
+   608→   608→            {windows.map((item) => (
+   609→   609→              <button
+   610→   610→                key={item}
+   611→   611→                type="button"
+   612→   612→                aria-pressed={windowKey === item}
+   613→   613→                onClick={() => setWindowKey(item)}
+   614→   614→                className={cn(
+   615→   615→                  "h-11 rounded-full px-4 text-sm",
+   616→   616→                  windowKey === item ? "bg-accent text-bg" : "border border-line bg-surface",
+   617→   617→                )}
+   618→   618→              >
+   619→   619→                Last {windowLabel[item]}
+   620→   620→              </button>
+   621→   621→            ))}
+   622→   622→          </div>
+   623→   623→          <div className="flex flex-wrap gap-2" role="group" aria-label="Liquidity">
+   624→   624→            <button
+   625→   625→              type="button"
+   626→   626→              aria-pressed={book === "tradable"}
+   627→   627→              onClick={() => setBook("tradable")}
+   628→   628→              className={cn(
+   629→   629→                "h-11 rounded-full px-4 text-sm",
+   630→   630→                book === "tradable" ? "bg-ink text-bg" : "border border-line bg-surface",
+   631→   631→              )}
+   632→   632→            >
+   633→   633→              Tradable books
+   634→   634→            </button>
+   635→   635→            <button
+   636→   636→              type="button"
+   637→   637→              aria-pressed={book === "deep"}
+   638→   638→              onClick={() => setBook("deep")}
+   639→   639→              className={cn(
+   640→   640→                "h-11 rounded-full px-4 text-sm",
+   641→   641→                book === "deep" ? "bg-ink text-bg" : "border border-line bg-surface",
+   642→   642→              )}
+   643→   643→            >
+   644→   644→              Deep books
+   645→   645→            </button>
+   646→   646→          </div>
+   647→   647→          <div className="flex flex-wrap gap-2">
+   648→   648→            {kindOptions.map((option) => (
+   649→   649→              <button
+   650→   650→                key={option.id}
+   651→   651→                type="button"
+   652→   652→                aria-pressed={kind === option.id}
+   653→   653→                onClick={() => setKind(option.id)}
+   654→   654→                className={cn("h-11 rounded-full px-3 text-sm", kind === option.id ? "bg-bg-deep text-ink" : "text-muted")}
+   655→   655→              >
+   656→   656→                {option.label}
+   657→   657→              </button>
+   658→   658→            ))}
+   659→   659→          </div>
+   660→   660→          <p className="max-w-2xl text-sm leading-relaxed text-muted">
+   661→   661→            {tab === "rising"
+   662→   662→              ? `Sorted by the last ${windowLabel[shownWindow]}. A bounce is up now but still red today — often the earliest tell. A run is already green on the day.`
+   663→   663→              : `Sorted by the last ${windowLabel[shownWindow]}. A fade is slipping after a green day. A slide is down on both.`}{" "}
+   664→   664→            {book === "deep"
+   665→   665→              ? "Deep books are names above $250M with at least $5M traded today."
+   666→   666→              : "Tradable books are names above $20M with at least $500k traded today, so a spike is more likely to be a real market."}
+   667→   667→          </p>
+   668→   668→          {data.window !== windowKey || data.book !== book ? (
+   669→   669→            <p className="text-sm text-accent">Switching the tape…</p>
+   670→   670→          ) : null}
+   671→   671→          {quiet ? (
+   672→   672→            <p className="text-sm text-muted">Quiet window — these are the largest ticks, all under 0.15%.</p>
+   673→   673→          ) : null}
+   674→   674→        </div>
+   675→   675→      ) : tab === "markets" ? (
+   676→   676→        <div className="mt-4 flex flex-wrap gap-2">
+   677→   677→          {(
+   678→   678→            [
+   679→   679→              ["rank", "Rank"],
+   680→   680→              ["change24h", "24h"],
+   681→   681→              ["change7d", "7d"],
+   682→   682→              ["marketCap", "Cap"],
+   683→   683→              ["volume24h", "Volume"],
+   684→   684→            ] as const
+   685→   685→          ).map(([id, label]) => (
+   686→   686→            <button
+   687→   687→              key={id}
+   688→   688→              type="button"
+   689→   689→              aria-pressed={sort === id}
+   690→   690→              onClick={() => setSort(id)}
+   691→   691→              className={cn("h-11 rounded-full px-3 text-sm", sort === id ? "bg-bg-deep text-ink" : "text-muted")}
+   692→   692→            >
+   693→   693→              {label}
+   694→   694→            </button>
+   695→   695→          ))}
+   696→   696→        </div>
+   697→   697→      ) : tab === "radar" ? null : (
+   698→   698→        <p className="mt-4 text-sm text-muted">Stars stay on this device. Prices refresh with the tape.</p>
+   699→   699→      )}
+   700→   700→
+   701→   701→      {lead && (tab === "rising" || tab === "falling") ? (
+   702→   702→        <div className="mt-5">
+   703→   703→          <LeadCard coin={lead} window={shownWindow} />
+   704→   704→        </div>
+   705→   705→      ) : null}
+   706→   706→
+   707→   707→      {tab === "radar" && !searching ? (
+   708→   708→        <RadarPanel />
+   709→   709→      ) : (
+   710→   710→      <section className="mt-4" aria-label={searching ? "Search results" : "Coins"}>
+   711→   711→        {tab === "saved" && savedIds.length === 0 && !searching ? (
+   712→   712→          <div className="rounded-2xl border border-dashed border-line px-5 py-10 text-center">
+   713→   713→            <p className="font-display text-2xl">Nothing saved yet</p>
+   714→   714→            <p className="mt-2 text-sm text-muted">Star a coin on the rising or falling tape to keep it here.</p>
+   715→   715→          </div>
+   716→   716→        ) : (searching && remote.isFetching && !remote.data) || (tab === "saved" && saved.isLoading) ? (
+   717→   717→          <p className="px-1 py-8 text-sm text-muted">Checking prices…</p>
+   718→   718→        ) : list.length === 0 ? (
+   719→   719→          <div className="rounded-2xl border border-dashed border-line px-5 py-10 text-center">
+   720→   720→            <p className="font-display text-2xl">
+   721→   721→              {searching ? "No coin by that name" : moverTab ? "Nothing is moving in this cut" : "No rows"}
+   722→   722→            </p>
+   723→   723→            <p className="mt-2 text-sm text-muted">
+   724→   724→              {moverTab && book === "deep"
+   725→   725→                ? "No large name has moved in this window. Try tradable books, or a wider window."
+   726→   726→                : searching
+   727→   727→                  ? "Check the spelling, or browse Rising."
+   728→   728→                  : "Pull to refresh in a moment."}
+   729→   729→            </p>
+   730→   730→          </div>
+   731→   731→        ) : (
+   732→   732→          <ol className="rounded-2xl border border-line bg-surface px-3 sm:px-4">
+   733→   733→            {(lead ? rows : list).map((coin) => {
+   734→   734→              const move = changeOf(coin, shownWindow);
+   735→   735→              const primary = searching || tab === "markets" || tab === "saved" ? coin.change24h : move;
+   736→   736→              const secondary = searching || tab === "markets" || tab === "saved" ? coin.change7d : coin.change24h;
+   737→   737→              const secondaryLabel = searching || tab === "markets" || tab === "saved" ? "7d" : "24h";
+   738→   738→              const resolved = !searching && moverTab ? signalFor(move, coin.change24h) : undefined;
+   739→   739→              return (
+   740→   740→                <CoinRow
+   741→   741→                  key={coin.id}
+   742→   742→                  coin={coin}
+   743→   743→                  primary={primary}
+   744→   744→                  secondary={secondary}
+   745→   745→                  secondaryLabel={secondaryLabel}
+   746→   746→                  signal={resolved}
+   747→   747→                />
+   748→   748→              );
+   749→   749→            })}
+   750→   750→          </ol>
+   751→   751→        )}
+   752→   752→        {!searching && moverTab && data.risingCount + data.fallingCount > 0 ? (
+   753→   753→          <p className="mt-3 text-xs text-muted">
+   754→   754→            Counts are coins that moved at least 0.15% in the last {windowShort[shownWindow]}. The list shows the
+   755→   755→            largest of those.
+   756→   756→          </p>
+   757→   757→        ) : null}
+   758→   758→      </section>
+   759→   759→      )}
+   760→   760→    </Shell>
+   761→   761→  );
+   762→   762→}
+   763→   763→

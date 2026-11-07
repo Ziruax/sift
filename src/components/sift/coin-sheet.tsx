@@ -1,0 +1,289 @@
+"use client";
+
+import { useQuery } from "@tanstack/react-query";
+import { ExternalLink, Star } from "lucide-react";
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { cn } from "@/lib/utils";
+import { formatCompact, formatDay, formatSupply, formatPrice, pairForSymbol } from "@/lib/market/format";
+import type { CoinDetail, MarketSignal, SignalsResponse } from "@/lib/market/types";
+import { usePosition } from "@/lib/watchlist";
+import { usePairStream } from "@/hooks/use-radar-socket";
+import { PriceChart } from "./price-chart";
+import { PositionTracker } from "./position-tracker";
+import { Pct, SignalTypeChip } from "./primitives";
+
+export type CoinTarget = { kind: "id"; id: string } | { kind: "pair"; pair: string } | null;
+
+async function fetchDetail(id: string): Promise<CoinDetail> {
+  const res = await fetch(`/api/coin/${encodeURIComponent(id)}`, { cache: "no-store" });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { error?: string } | null;
+    throw new Error(body?.error ?? `Request failed (${res.status})`);
+  }
+  return res.json() as Promise<CoinDetail>;
+}
+
+// Resolve a Binance pair to the matching CoinPaprika coin (best-effort).
+async function fetchLookup(pair: string): Promise<CoinDetail | null> {
+  const res = await fetch(`/api/coin/lookup?pair=${encodeURIComponent(pair)}`, { cache: "no-store" });
+  if (!res.ok) return null;
+  const body = (await res.json()) as { found: boolean; detail: CoinDetail | null };
+  return body.detail ?? null;
+}
+
+function useCoinDetail(target: CoinTarget) {
+  const idKey = target?.kind === "id" ? target.id : null;
+  const pairKey = target?.kind === "pair" ? target.pair : null;
+
+  const byId = useQuery<CoinDetail>({
+    queryKey: ["coin", idKey],
+    queryFn: () => fetchDetail(idKey as string),
+    enabled: idKey !== null,
+    staleTime: 60_000,
+  });
+
+  const byPair = useQuery<CoinDetail | null>({
+    queryKey: ["lookup", pairKey],
+    queryFn: () => fetchLookup(pairKey as string),
+    enabled: pairKey !== null && !byId.data,
+    staleTime: 300_000,
+  });
+
+  if (idKey !== null) return byId;
+  return {
+    ...byPair,
+    data: byPair.data ?? undefined,
+    isLoading: byPair.isLoading,
+  } as typeof byId;
+}
+
+const CHANGES: { key: keyof CoinDetail["coin"]; label: string }[] = [
+  { key: "change15m", label: "15m" },
+  { key: "change30m", label: "30m" },
+  { key: "change1h", label: "1h" },
+  { key: "change6h", label: "6h" },
+  { key: "change24h", label: "24h" },
+  { key: "change7d", label: "7d" },
+];
+
+export function CoinSheet({
+  target,
+  onClose,
+  subscribe,
+  unsubscribe,
+  isStarred,
+  onToggleStar,
+}: {
+  target: CoinTarget;
+  onClose: () => void;
+  subscribe: (pair: string) => void;
+  unsubscribe: (pair: string) => void;
+  isStarred: (id: string) => boolean;
+  onToggleStar: (id: string) => void;
+}) {
+  const detail = useCoinDetail(target);
+  const coin = detail.data?.coin ?? null;
+  const pair = coin ? pairForSymbol(coin.symbol) : target?.kind === "pair" ? target.pair : null;
+  const base = pair ? pair.replace(/USDT$/, "") : "";
+  const update = usePairStream(pair, subscribe, unsubscribe);
+  const { position, save } = usePosition(pair);
+
+  const signals = useQuery<MarketSignal[]>({
+    queryKey: ["pair-signals", pair],
+    queryFn: async () => {
+      const res = await fetch(`/api/signals?pair=${encodeURIComponent(pair ?? "")}&limit=8`, { cache: "no-store" });
+      if (!res.ok) return [];
+      const body = (await res.json()) as SignalsResponse;
+      return body.signals;
+    },
+    enabled: pair !== null,
+    refetchInterval: 30_000,
+  });
+
+  const open = target !== null;
+
+  return (
+    <Sheet open={open} onOpenChange={(v) => !v && onClose()}>
+      <SheetContent
+        side="right"
+        className="flex w-full flex-col gap-0 overflow-y-auto p-0 sm:max-w-xl md:max-w-2xl bg-background"
+      >
+        <SheetHeader className="space-y-0 border-b border-border px-5 py-4">
+          <SheetDescription className="sr-only">
+            Live market detail, price history and position tracker for {coin?.name ?? base}
+          </SheetDescription>
+          <SheetTitle asChild>
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                {detail.isLoading ? (
+                  <div className="h-7 w-40 animate-pulse rounded bg-muted" />
+                ) : coin ? (
+                  <>
+                    <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                      <span className="truncate text-xl font-semibold">{coin.name}</span>
+                      <span className="font-mono text-sm text-muted-foreground">{coin.symbol}</span>
+                      {coin.rank > 0 && (
+                        <span className="num rounded-md border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                          #{coin.rank}
+                        </span>
+                      )}
+                    </div>
+                    <p className="num mt-1.5 font-mono text-2xl font-bold leading-none">
+                      {formatPrice(coin.price)}
+                      <span className="ml-3 text-sm font-medium">
+                        <Pct value={coin.change24h} />
+                      </span>
+                    </p>
+                  </>
+                ) : (
+                  <span className="font-mono text-xl font-semibold">{base || "Coin"}</span>
+                )}
+              </div>
+              {coin && (
+                <button
+                  type="button"
+                  onClick={() => onToggleStar(coin.id)}
+                  className="grid size-9 shrink-0 place-items-center rounded-lg border border-border text-muted-foreground transition-colors hover:text-warn focus-visible:outline-2 focus-visible:outline-ring"
+                  aria-label={isStarred(coin.id) ? "Remove from watchlist" : "Add to watchlist"}
+                  aria-pressed={isStarred(coin.id)}
+                >
+                  <Star className={cn("size-4", isStarred(coin.id) && "fill-warn text-warn")} />
+                </button>
+              )}
+            </div>
+          </SheetTitle>
+
+          {coin && (
+            <div className="mt-3 grid grid-cols-3 gap-1.5 sm:grid-cols-6">
+              {CHANGES.map(({ key, label }) => (
+                <div key={key} className="rounded-lg bg-muted/50 px-2 py-1.5 text-center">
+                  <p className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</p>
+                  <p className="num mt-0.5 font-mono text-xs font-medium">
+                    <Pct value={coin[key] as number} />
+                  </p>
+                </div>
+              ))}
+            </div>
+          )}
+        </SheetHeader>
+
+        <div className="flex-1 space-y-4 px-5 py-4">
+          {/* Live tracker */}
+          <PositionTracker pair={pair} base={base || (coin?.symbol ?? "")} update={update} position={position} onSave={save} />
+
+          {/* Chart */}
+          <PriceChart symbol={coin?.symbol ?? base ?? null} />
+
+          {/* Recent signals */}
+          {pair && (
+            <div className="rounded-xl border border-border bg-card p-4">
+              <h3 className="text-sm font-semibold">Recent radar signals</h3>
+              {signals.isLoading ? (
+                <div className="mt-2 h-16 animate-pulse rounded-lg bg-muted" />
+              ) : signals.data && signals.data.length > 0 ? (
+                <ul className="mt-2 divide-y divide-border/60">
+                  {signals.data.map((s) => (
+                    <li key={s.id} className="flex items-center justify-between gap-2 py-2 text-xs">
+                      <span className="flex items-center gap-2">
+                        <SignalTypeChip type={s.type} compact />
+                        <span className="num font-mono text-muted-foreground">
+                          {new Date(s.createdAt).toLocaleTimeString([], { hour12: false })}
+                        </span>
+                      </span>
+                      <span className="flex items-center gap-2">
+                        {s.change60m !== null ? <Pct value={s.change60m} /> : <span className="text-[10px] text-muted-foreground">{s.status === "final" ? "—" : "live"}</span>}
+                        {s.mfe !== null && (
+                          <span className="num font-mono text-[10px] text-muted-foreground">MFE <Pct value={s.mfe} /></span>
+                        )}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="mt-1 text-xs text-muted-foreground">No signals for this pair in the retained window — quiet tape.</p>
+              )}
+            </div>
+          )}
+
+          {/* Meta */}
+          {coin && (
+            <div className="space-y-3 rounded-xl border border-border bg-card p-4">
+              <h3 className="text-sm font-semibold">About</h3>
+              {detail.data?.description ? (
+                <p className="text-xs leading-relaxed text-muted-foreground">{detail.data.description}</p>
+              ) : (
+                <p className="text-xs text-muted-foreground">No description available.</p>
+              )}
+              <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs sm:grid-cols-3">
+                <div>
+                  <dt className="text-muted-foreground">Market cap</dt>
+                  <dd className="num font-mono">{formatCompact(coin.marketCap)}</dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">24h volume</dt>
+                  <dd className="num font-mono">{formatCompact(coin.volume24h)}</dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">Circulating</dt>
+                  <dd className="num font-mono">{formatSupply(coin.circulating)}</dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">Max supply</dt>
+                  <dd className="num font-mono">{formatSupply(coin.maxSupply)}</dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">All-time high</dt>
+                  <dd className="num font-mono">
+                    {formatPrice(coin.athPrice)}
+                    <span className="ml-1 text-muted-foreground">({formatDay(coin.athDate)})</span>
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">From ATH</dt>
+                  <dd><Pct value={coin.fromAth} /></dd>
+                </div>
+              </dl>
+              {detail.data && (detail.data.website || detail.data.explorer || detail.data.whitepaper) && (
+                <div className="flex flex-wrap gap-3 pt-1">
+                  {[
+                    ["Website", detail.data.website],
+                    ["Explorer", detail.data.explorer],
+                    ["Whitepaper", detail.data.whitepaper],
+                  ]
+                    .filter(([, href]) => href !== null)
+                    .map(([label, href]) => (
+                      <a
+                        key={label}
+                        href={href as string}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 rounded-lg border border-border px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
+                      >
+                        {label}
+                        <ExternalLink className="size-3" aria-hidden="true" />
+                      </a>
+                    ))}
+                </div>
+              )}
+              {detail.data && detail.data.tags.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 pt-1">
+                  {detail.data.tags.map((tag) => (
+                    <span key={tag} className="rounded-md bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                      {tag}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {detail.isError && (
+            <p className="rounded-lg border border-down/40 bg-down-soft px-3 py-2 text-xs text-down">
+              Coin details failed to load: {detail.error.message} — the live tracker and chart still work.
+            </p>
+          )}
+        </div>
+      </SheetContent>
+    </Sheet>
+  );
+}

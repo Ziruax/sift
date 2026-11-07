@@ -1,6 +1,6 @@
 "use client";
 
-import { Bell, BellOff, Radar, Moon, Sun, ArrowUpRight, Volume2, VolumeX, CheckCheck, Trash2 } from "lucide-react";
+import { Bell, BellOff, Radar, Moon, Sun, ArrowUpRight, Volume2, VolumeX, CheckCheck, Trash2, FlaskConical } from "lucide-react";
 import { useTheme } from "next-themes";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
@@ -12,16 +12,19 @@ import {
   type AppNotification,
 } from "@/lib/notifications";
 import { LiveDot } from "./primitives";
+import { BtcModeBar } from "./v2-primitives";
 import type { ConnectionState } from "@/hooks/use-radar-socket";
+import type { BtcContext } from "@/lib/market/types";
 import { Bot as BotIcon } from "lucide-react";
 
-export type TabId = "radar" | "markets" | "signals" | "bots" | "saved";
+export type TabId = "radar" | "markets" | "signals" | "bots" | "backtest" | "saved";
 
 const TABS: { id: TabId; label: string; hint: string }[] = [
-  { id: "radar", label: "Radar", hint: "Live pump & dump radar" },
+  { id: "radar", label: "Radar", hint: "Live pump & dump radar — V2 filtered" },
   { id: "markets", label: "Markets", hint: "The minute tape" },
   { id: "signals", label: "Signals", hint: "Every signal, graded by what happened next" },
   { id: "bots", label: "Bots", hint: "Your investments and price ranges — instant alerts" },
+  { id: "backtest", label: "Backtest", hint: "Replay the V2 filters on 30 days of history — the proof before the promise" },
   { id: "saved", label: "Saved", hint: "Your watchlist" },
 ];
 
@@ -211,6 +214,8 @@ export function Shell({
   updatedAt,
   children,
   tabCounts,
+  btc,
+  goLongCount,
 }: {
   tab: TabId;
   onTab: (tab: TabId) => void;
@@ -218,6 +223,8 @@ export function Shell({
   updatedAt: string | null;
   children: ReactNode;
   tabCounts?: Partial<Record<TabId, number>>;
+  btc?: BtcContext | null;
+  goLongCount?: number | null;
 }) {
   const conn = CONNECTION_COPY[connection];
   return (
@@ -264,6 +271,7 @@ export function Shell({
                 >
                   {t.id === "radar" && <Radar className="size-3.5" aria-hidden="true" />}
                   {t.id === "bots" && <BotIcon className="size-3.5" aria-hidden="true" />}
+                  {t.id === "backtest" && <FlaskConical className="size-3.5" aria-hidden="true" />}
                   {t.label}
                   {typeof count === "number" && count > 0 && (
                     <span className="num rounded-full bg-muted px-1.5 py-0.5 font-mono text-[10px] leading-none text-muted-foreground">{count}</span>
@@ -273,6 +281,7 @@ export function Shell({
             })}
           </div>
         </nav>
+        <BtcModeBar btc={btc ?? null} longs={goLongCount ?? null} />
       </header>
 
       <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-6 pb-28 sm:pb-6">{children}</main>
@@ -283,9 +292,12 @@ export function Shell({
             Radar and live prices from Binance&rsquo;s public market streams — scanned server-side every 5 seconds where a
             scanner runs, or tick-by-tick in your browser when it doesn&rsquo;t. The board, coin pages and search read
             CoinPaprika directly from your device; charts use Binance klines with DeFiLlama as fallback; sentiment is the
-            alternative.me Fear &amp; Greed index. Bots poll FreeCryptoAPI on a short cadence — only while you have armed
-            ranges — for instant, confirmed price captures. Signals are graded by what the price actually did 5, 15 and 60
-            minutes later.
+            alternative.me Fear &amp; Greed index. V2 verdicts pass seven filters — momentum, dollar volume, order-book
+            walls, trade count, buyer traps, BTC regime and a stablecoin veto — before saying go long or go short, and
+            every go signal ships an ATR-sized stop and take-profit plan. Bots poll FreeCryptoAPI on a short cadence —
+            only while you have armed ranges — for instant, confirmed price captures. Signals are graded by what the
+            price actually did 5, 15 and 60 minutes later, and the Backtest tab replays the same filters over a month
+            of history before you trust them with anything.
           </p>
           <p className="mt-1">
             Not investment advice. Signals are observations, not predictions — a coin can dump 30% a minute after

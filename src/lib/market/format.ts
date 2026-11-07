@@ -48,9 +48,25 @@ export const SIGNAL_META: Record<
     tone: "warn",
     hint: "A 3x+ volume spike collapsed under 1.5x — the crowd that arrived is leaving.",
   },
+  go_long: {
+    label: "Go long — V2 confirmed",
+    short: "GO LONG",
+    direction: "long",
+    tone: "up",
+    hint: "All seven V2 filters passed: momentum green, real dollar volume, wall cleared, liquidity healthy, BTC regime supportive, not a stablecoin — and the trade plan's profit zone is not blocked.",
+  },
+  go_short: {
+    label: "Go short — V2 confirmed",
+    short: "GO SHORT",
+    direction: "short",
+    tone: "down",
+    hint: "The mirrored V2 gates for dumps: tape red on both timeframes, sellers in control, ceiling wall overhead, liquidity real, and BTC not in bull mode.",
+  },
 };
 
 export const SIGNAL_ORDER: SignalType[] = [
+  "go_long",
+  "go_short",
   "pump_start",
   "volume_lead",
   "buyer_pressure",

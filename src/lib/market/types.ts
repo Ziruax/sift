@@ -90,6 +90,61 @@ export type HistoryResult = {
 export type RadarBadge = "pump" | "early" | "dumping" | "pumped";
 export type RadarSignal = "pumping" | "dumping" | "long" | "short" | "flat";
 
+// ── V2 accuracy layer (see lib/market/v2-engine.ts) ─────────────────────────
+
+export type BtcMode = "bull" | "flat" | "dump";
+
+export type BtcContext = {
+  price: number;
+  change5m: number;
+  change15m: number;
+  change1h: number;
+  change24h: number;
+  mode: BtcMode;
+};
+
+export type V2Check = { label: string; pass: boolean | null; note: string };
+
+export type TradePlan = {
+  side: "long" | "short";
+  entry: number;
+  stop: number;
+  tp1: number;
+  tp2: number;
+  riskPct: number;
+  tp1Pct: number;
+  tp2Pct: number;
+  riskReward1: number;
+  riskReward2: number;
+  atrPct: number | null;
+  blocked: boolean;
+  blockReason: string | null;
+};
+
+export type Scenario = { tone: "bull" | "base" | "bear"; title: string; body: string };
+
+export type RowVerdict = "go_long" | "go_short" | "watch" | "skip" | "blocked_btc" | "stable";
+export type SideVerdict = "go" | "watch" | "skip" | "blocked_btc";
+
+export type RadarRowV2 = {
+  longScore: number;
+  shortScore: number;
+  verdict: RowVerdict;
+  longVerdict: SideVerdict;
+  shortVerdict: SideVerdict;
+  checks: V2Check[];
+  shortChecks: V2Check[];
+  warnings: string[];
+  wall: { price: number; valueUsd: number; distPct: number } | null;
+  bidWall: { price: number; valueUsd: number; distPct: number } | null;
+  wallKnown: boolean; // false → "no wall data yet", true + null → genuinely clear
+  wallBroken: boolean | null;
+  atrPct: number | null;
+  trade: TradePlan | null;
+  shortTrade: TradePlan | null;
+  scenarios: Scenario[];
+};
+
 export type RadarRow = {
   pair: string; // e.g. "PEPEUSDT"
   base: string; // e.g. "PEPE"
@@ -114,6 +169,8 @@ export type RadarRow = {
   spikeFalling: boolean; // 3x+ spike collapsed below 1.5x — buyers leaving
   signal: RadarSignal;
   spark: number[]; // last 60 one-minute closes
+  atrPct: number | null; // 14-bar 1m ATR as % of price — sizes the V2 stop
+  v2: RadarRowV2 | null; // the seven-filter accuracy layer (candidates)
 };
 
 export type RadarSnapshot = {
@@ -123,6 +180,7 @@ export type RadarSnapshot = {
   clients: number;
   scans: number;
   stale: boolean; // true when the feed failed and this is the last good scan
+  btc: BtcContext | null; // the market regime filter, live
 };
 
 // ── Signals (persisted opportunity log with graded outcomes) ────────────────
@@ -133,7 +191,9 @@ export type SignalType =
   | "buyer_pressure"
   | "seller_pressure"
   | "dump_start"
-  | "spike_collapse";
+  | "spike_collapse"
+  | "go_long"
+  | "go_short";
 
 export type SignalDirection = "long" | "short";
 
@@ -160,6 +220,11 @@ export type MarketSignal = {
   mfe: number | null;
   mae: number | null;
   status: "pending" | "partial" | "final";
+  // V2 trade plan attached to go_long / go_short signals.
+  sl?: number | null;
+  tp1?: number | null;
+  tp2?: number | null;
+  atrPct?: number | null;
 };
 
 export type SignalTypeStat = {
@@ -203,6 +268,8 @@ export type PairUpdate = {
   volumeLead: boolean;
   spikeFalling: boolean;
   askWall: { price: number; valueUsd: number } | null;
+  bidWall: { price: number; valueUsd: number } | null;
   spark: number[];
   exists: boolean; // false when Binance has no such USDT pair
+  v2: RadarRowV2 | null;
 };

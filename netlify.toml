@@ -1,0 +1,26 @@
+# Netlify configuration — the whole site builds in the sandbox (or locally)
+# and only the finished artifacts upload, so Netlify's free build minutes are
+# never spent on this app.
+#
+#   bunx netlify-cli build          # compile + package locally
+#   bunx netlify-cli deploy --prod  # upload the result
+#
+# The Next.js runtime plugin turns the App Router pages into Netlify
+# functions automatically; the radar mini-service does not deploy — the
+# in-browser engine (Binance public websockets) takes over as the live
+# scanner, which is exactly how the app is designed to run standalone.
+
+[build]
+  command = "bun run build:netlify"
+  publish = ".next"
+
+[build.environment]
+  NODE_VERSION = "22"
+  # SQLite on serverless is ephemeral — the browser's localStorage signal log
+  # is the durable one by design. A /tmp path keeps the API routes functional
+  # per-function-instance instead of erroring on the sandbox path baked into .env.
+  DATABASE_URL = "file:/tmp/sift.db"
+  NEXT_TELEMETRY_DISABLED = "1"
+
+[[plugins]]
+  package = "@netlify/plugin-nextjs"

@@ -1,7 +1,9 @@
 import type { NextConfig } from "next";
 
+// Standalone output powers the sandbox's `bun run start`; Netlify wants the
+// standard build layout which @netlify/plugin-nextjs processes into functions.
 const nextConfig: NextConfig = {
-  output: "standalone",
+  ...(process.env.NETLIFY ? {} : { output: "standalone" }),
   /* config options here */
   typescript: {
     ignoreBuildErrors: true,

@@ -66,6 +66,13 @@ function graded(change: number | null, direction: "long" | "short"): number | nu
   return direction === "long" ? change : -change;
 }
 
+function shortPrice(v: number | null | undefined): string {
+  if (v === null || v === undefined || !Number.isFinite(v)) return "—";
+  if (v < 0.01) return v.toPrecision(3);
+  if (v < 100) return v.toFixed(4);
+  return v.toFixed(2);
+}
+
 export function SignalsView({ refreshKey, onOpenPair }: { refreshKey: number; onOpenPair: (pair: string) => void }) {
   const [type, setType] = useState<SignalType | "all">("all");
   const { data, isLoading } = useSignals(type === "all" ? null : type, refreshKey);
@@ -203,6 +210,7 @@ export function SignalsView({ refreshKey, onOpenPair }: { refreshKey: number; on
                   <th scope="col" className="px-2 py-2.5 font-medium">Signal</th>
                   <th scope="col" className="px-2 py-2.5 text-center font-medium">Score</th>
                   <th scope="col" className="px-2 py-2.5 text-right font-medium">At price</th>
+                  <th scope="col" className="hidden px-2 py-2.5 text-right font-medium xl:table-cell">Stop / TP1 / TP2</th>
                   <th scope="col" className="px-2 py-2.5 text-right font-medium">+5m</th>
                   <th scope="col" className="px-2 py-2.5 text-right font-medium">+15m</th>
                   <th scope="col" className="px-2 py-2.5 text-right font-medium">+60m</th>
@@ -220,7 +228,10 @@ export function SignalsView({ refreshKey, onOpenPair }: { refreshKey: number; on
                   return (
                     <tr
                       key={s.id}
-                      className="cursor-pointer border-b border-border/60 transition-colors last:border-0 hover:bg-accent/5"
+                      className={cn(
+                        "cursor-pointer border-b border-border/60 transition-colors last:border-0 hover:bg-accent/5",
+                        (s.type === "go_long" || s.type === "go_short") && "bg-accent/5",
+                      )}
                       onClick={() => onOpenPair(s.pair)}
                       tabIndex={0}
                       onKeyDown={(e) => e.key === "Enter" && onOpenPair(s.pair)}
@@ -234,6 +245,19 @@ export function SignalsView({ refreshKey, onOpenPair }: { refreshKey: number; on
                       <td className="px-2 py-2.5 text-center"><ScorePill score={s.score} size="sm" /></td>
                       <td className="num px-2 py-2.5 text-right font-mono text-xs">
                         {s.price < 0.01 ? s.price.toPrecision(4) : s.price.toFixed(s.price < 100 ? 4 : 2)}
+                      </td>
+                      <td className="num hidden px-2 py-2.5 text-right font-mono text-[11px] xl:table-cell">
+                        {s.sl !== null && s.sl !== undefined ? (
+                          <span title={`Stop ${s.sl.toPrecision(6)} · TP1 ${s.tp1?.toPrecision(6)} · TP2 ${s.tp2?.toPrecision(6)}${s.atrPct !== null && s.atrPct !== undefined ? ` · sized to ${s.atrPct.toFixed(2)}% ATR` : ""}`}>
+                            <span className="text-down">{shortPrice(s.sl)}</span>
+                            <span className="text-muted-foreground"> → </span>
+                            <span className="text-up">{shortPrice(s.tp1)}</span>
+                            <span className="text-muted-foreground"> / </span>
+                            <span className="text-up">{shortPrice(s.tp2)}</span>
+                          </span>
+                        ) : (
+                          <span className="text-muted-foreground">—</span>
+                        )}
                       </td>
                       <td className="px-2 py-2.5 text-right">{pending && s.change5m === null ? <span className="text-[10px] text-muted-foreground">…</span> : <Pct value={g5 ?? s.change5m} />}</td>
                       <td className="px-2 py-2.5 text-right">{pending && s.change15m === null ? <span className="text-[10px] text-muted-foreground">…</span> : <Pct value={g15 ?? s.change15m} />}</td>

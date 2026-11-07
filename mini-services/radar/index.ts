@@ -22,6 +22,16 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { Server, type Socket } from "socket.io";
+import {
+  CooldownLedger,
+  V2,
+  assessRow,
+  atrPctFromCandles,
+  btcModeFor,
+  stablecoinLike,
+  type V2Wall,
+} from "../../src/lib/market/v2-engine";
+import type { BtcContext, RadarRowV2 } from "../../src/lib/market/types";
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
@@ -37,7 +47,6 @@ const STATS_REFRESH_MS = 60_000; // 24h ticker stats cadence
 const SIGNAL_COOLDOWN_MS = 10 * 60_000; // per pair+type
 const MAX_SIGNALS_PER_SCAN = 6;
 const OUTCOME_HORIZON_MS = 60 * 60_000;
-const WALL_TTL_MS = 15_000;
 // Adaptive pacing tiers, keyed on the last observed x-mbx-used-weight-1m.
 // This sandbox shares an egress IP with other Binance traffic, so the
 // scanner must watch the shared weight window and yield when it fills.
@@ -83,6 +92,8 @@ type RadarRow = {
   spikeFalling: boolean;
   signal: RadarSignal;
   spark: number[];
+  atrPct: number | null;
+  v2: RadarRowV2 | null;
 };
 
 type RadarSnapshot = {
@@ -92,6 +103,7 @@ type RadarSnapshot = {
   clients: number;
   scans: number;
   stale: boolean;
+  btc: BtcContext | null;
 };
 
 type SignalType =
@@ -100,7 +112,9 @@ type SignalType =
   | "buyer_pressure"
   | "seller_pressure"
   | "dump_start"
-  | "spike_collapse";
+  | "spike_collapse"
+  | "go_long"
+  | "go_short";
 
 type TrackedSignal = {
   id: string;
@@ -116,6 +130,10 @@ type TrackedSignal = {
   volume24h: number;
   note: string | null;
   createdAt: number;
+  sl: number | null;
+  tp1: number | null;
+  tp2: number | null;
+  atrPct: number | null;
   // outcome tracking
   sentNew: boolean;
   sent5m: boolean;
@@ -216,7 +234,13 @@ const cooldowns = new Map<string, number>(); // `${pair}:${type}` → last fired
 
 const pairRooms = new Map<string, Set<string>>(); // pair → socket ids
 const pairMissing = new Map<string, number>(); // pair → last time we verified it doesn't exist
-const wallCache = new Map<string, { at: number; wall: { price: number; valueUsd: number } | null }>();
+type Walls = { at: number; ask: { price: number; valueUsd: number } | null; bid: { price: number; valueUsd: number } | null };
+const wallCache = new Map<string, Walls>();
+const wallBreaks = new Map<string, { wallPrice: number; aboveSince: number | null }>();
+// Candidates worth spending depth requests on — refreshed every scan.
+let wallCandidates: string[] = [];
+const ledger = new CooldownLedger();
+let btcContext: BtcContext | null = null;
 
 let lastSnapshot: RadarSnapshot | null = null;
 let scans = 0;
@@ -342,7 +366,7 @@ io.on("connection", (socket: Socket) => {
 
 function snapshotForClients(): RadarSnapshot {
   if (lastSnapshot) {
-    return { ...lastSnapshot, clients: io.engine.clientsCount, stale: consecutiveFailures > 0 };
+    return { ...lastSnapshot, clients: io.engine.clientsCount, stale: consecutiveFailures > 0, btc: btcContext };
   }
   return {
     rows: [],
@@ -351,6 +375,7 @@ function snapshotForClients(): RadarSnapshot {
     clients: io.engine.clientsCount,
     scans,
     stale: false,
+    btc: btcContext,
   };
 }
 
@@ -471,6 +496,12 @@ function toRow(ticker: Ticker24h, klines: Kline[]): RadarRow | null {
   const change24h = num(ticker.priceChangePercent);
   const badge = badgeFor(score, rvol, change24h, belowHighPct);
 
+  // V2 inputs computed alongside the row: ATR from the candle highs/lows.
+  const atrPct = atrPctFromCandles(
+    klines.map((k) => ({ high: num(k[2]), low: num(k[3]), close: num(k[4]) })),
+    14,
+  );
+
   const row: RadarRow = {
     pair,
     base: pair.slice(0, -4),
@@ -495,6 +526,8 @@ function toRow(ticker: Ticker24h, klines: Kline[]): RadarRow | null {
     spikeFalling,
     signal: "flat",
     spark: closes.slice(-60),
+    atrPct,
+    v2: null,
   };
   row.signal = decideSignal(row);
   return row;
@@ -535,6 +568,20 @@ async function refreshUniverse(): Promise<void> {
     const symbol = String(row.symbol).toUpperCase();
     nextUniverse.push(symbol);
     nextStats.set(symbol, row);
+  }
+  // BTC and ETH always ride along — the V2 market-regime filter reads BTC's
+  // own 15m tape every scan, and ETH is the liquidity bellwether.
+  for (const anchor of ["BTCUSDT", "ETHUSDT"]) {
+    if (nextUniverse.includes(anchor)) continue;
+    try {
+      const t = (await binanceFetch(`/api/v3/ticker/24hr?symbol=${anchor}`, 8_000)) as Ticker24h;
+      if (typeof t.symbol === "string") {
+        nextUniverse.push(anchor);
+        nextStats.set(anchor, t);
+      }
+    } catch {
+      /* anchor stays absent this round — retry in 5 minutes */
+    }
   }
   universe = nextUniverse;
   statsUpdatedAt = Date.now();
@@ -652,31 +699,89 @@ async function universeTaskLoop(): Promise<void> {
   }
 }
 
-// ── Sell wall (subscribed pairs only) ────────────────────────────────────────
+// ── Order book walls (candidates + subscribed pairs) ─────────────────────
 
-async function getAskWall(pair: string, price: number): Promise<{ price: number; valueUsd: number } | null> {
+const WALL_TTL_MS = 25_000; // refresh cadence target
+const WALL_KNOWN_MS = 75_000; // older than this → "no data" again
+const WALL_CANDIDATE_MIN_SCORE = 50;
+const WALL_CANDIDATE_LIMIT = 12;
+
+async function fetchWalls(pair: string, price: number): Promise<Walls | null> {
   if (price <= 0) return null;
-  const cached = wallCache.get(pair);
-  if (cached && Date.now() - cached.at < WALL_TTL_MS) return cached.wall;
   try {
     const payload = (await binanceFetch(`/api/v3/depth?symbol=${pair}&limit=20`, 8_000)) as {
       asks?: Array<[string, string]>;
+      bids?: Array<[string, string]>;
     };
     const asks = Array.isArray(payload.asks) ? payload.asks : [];
-    let best: { price: number; valueUsd: number } | null = null;
+    const bids = Array.isArray(payload.bids) ? payload.bids : [];
+    let bestAsk: { price: number; valueUsd: number } | null = null;
     for (const [rawPrice, rawQty] of asks) {
       const askPrice = num(rawPrice);
       const qty = num(rawQty);
-      if (askPrice <= 0 || askPrice > price * 1.02) continue;
+      if (askPrice <= price || askPrice > price * (1 + V2.wallScanPct / 100)) continue;
       const valueUsd = askPrice * qty;
-      if (!best || valueUsd > best.valueUsd) best = { price: askPrice, valueUsd };
+      if (!bestAsk || valueUsd > bestAsk.valueUsd) bestAsk = { price: askPrice, valueUsd };
     }
-    wallCache.set(pair, { at: Date.now(), wall: best });
-    return best;
+    let bestBid: { price: number; valueUsd: number } | null = null;
+    for (const [rawPrice, rawQty] of bids) {
+      const bidPrice = num(rawPrice);
+      const qty = num(rawQty);
+      if (bidPrice >= price || bidPrice < price * (1 - V2.wallScanPct / 100)) continue;
+      const valueUsd = bidPrice * qty;
+      if (!bestBid || valueUsd > bestBid.valueUsd) bestBid = { price: bidPrice, valueUsd };
+    }
+    const walls: Walls = { at: Date.now(), ask: bestAsk, bid: bestBid };
+    wallCache.set(pair, walls);
+    return walls;
   } catch {
-    // Feed failed — hide the wall rather than fake one, but retry soon.
-    wallCache.set(pair, { at: Date.now() - WALL_TTL_MS + 3_000, wall: null });
+    // Feed failed — keep whatever we had, marked stale, and retry soon.
     return null;
+  }
+}
+
+function knownWalls(pair: string): { ask: V2Wall; bid: V2Wall; known: boolean } {
+  const cached = wallCache.get(pair);
+  if (!cached || Date.now() - cached.at > WALL_KNOWN_MS) return { ask: null, bid: null, known: false };
+  return { ask: cached.ask, bid: cached.bid, known: true };
+}
+
+// "Wall broken — confirmed": price must hold above the wall for 2 minutes.
+// Evaluated every scan against the latest cached wall; a moved wall resets it.
+function wallBreakState(pair: string, price: number, ask: V2Wall): boolean | null {
+  if (ask === null) return null; // no wall → nothing to break
+  let track = wallBreaks.get(pair);
+  if (!track || Math.abs(track.wallPrice - ask.price) / ask.price > 0.001) {
+    track = { wallPrice: ask.price, aboveSince: null };
+    wallBreaks.set(pair, track);
+  }
+  if (price > ask.price) {
+    if (track.aboveSince === null) track.aboveSince = Date.now();
+    return Date.now() - track.aboveSince >= V2.wallConfirmMs;
+  }
+  track.aboveSince = null;
+  return false;
+}
+
+// Paced background task: rotates depth requests through the current
+// candidates (top-scoring rows + subscribed pairs), one pair per tick, so the
+// order-book spend stays tiny and nothing bursts.
+async function wallPumpLoop(): Promise<void> {
+  let cursor = 0;
+  while (!stopped && isCurrentGeneration()) {
+    await sleep(2_500);
+    if (bannedUntil > Date.now()) continue;
+    const rotation = [...new Set([...wallCandidates, ...pairRooms.keys()])];
+    if (rotation.length === 0) continue;
+    const pair = rotation[cursor % rotation.length];
+    cursor += 1;
+    if (!pair) continue;
+    const cached = wallCache.get(pair);
+    if (cached && Date.now() - cached.at < WALL_TTL_MS) continue; // fresh enough
+    const row = lastSnapshot?.rows.find((r) => r.pair === pair);
+    const price = row?.price ?? 0;
+    if (price <= 0) continue;
+    await fetchWalls(pair, price);
   }
 }
 
@@ -689,7 +794,14 @@ const DIRECTION: Record<SignalType, "long" | "short"> = {
   seller_pressure: "short",
   dump_start: "short",
   spike_collapse: "short",
+  go_long: "long",
+  go_short: "short",
 };
+
+// Signals that, once fired, mean "do not contradict me for an hour" — the
+// anti-flip-flop rule. A coin that just dumped or exited cannot go long for
+// 60 minutes; a coin that just said "go short" cannot go long for 30.
+const BEARISH_TYPES: SignalType[] = ["seller_pressure", "dump_start", "spike_collapse"];
 
 function signalNote(type: SignalType, row: RadarRow): string {
   switch (type) {
@@ -705,6 +817,22 @@ function signalNote(type: SignalType, row: RadarRow): string {
       return `${row.belowHighPct.toFixed(1)}% below the session high with ${row.rvol.toFixed(1)}× volume and a falling 5m tape.`;
     case "spike_collapse":
       return `Volume spike collapsed to ${row.rvol.toFixed(1)}× — the crowd that pushed the move is leaving.`;
+    case "go_long": {
+      const v = row.v2;
+      const t = v?.trade;
+      const parts: string[] = [`V2 score ${v?.longScore ?? row.score} — all seven filters passed`];
+      if (t) parts.push(`stop −${t.riskPct.toFixed(1)}%, TP1 +${t.tp1Pct.toFixed(1)}%, TP2 +${t.tp2Pct.toFixed(1)}%`);
+      if (v?.wall) parts.push(`cleared the $${Math.round(v.wall.valueUsd / 1000)}K wall`);
+      return `${parts.join(" · ")}.`;
+    }
+    case "go_short": {
+      const v = row.v2;
+      const t = v?.shortTrade;
+      const parts: string[] = [`V2 short score ${v?.shortScore ?? row.score} — dump confirmed by the filters`];
+      if (t) parts.push(`stop +${t.riskPct.toFixed(1)}%, TP1 −${t.tp1Pct.toFixed(1)}%, TP2 −${t.tp2Pct.toFixed(1)}%`);
+      if (v?.wall) parts.push(`trapped under the $${Math.round(v.wall.valueUsd / 1000)}K wall`);
+      return `${parts.join(" · ")}.`;
+    }
   }
 }
 
@@ -723,18 +851,29 @@ function detectSignals(rows: RadarRow[]): TrackedSignal[] {
     if (row.belowHighPct >= 3 && row.rvol >= 2 && row.change5m < 0) candidates.push("dump_start");
     if (row.spikeFalling) candidates.push("spike_collapse");
 
+    // V2 gated signals — only when the seven-filter assessment says GO, the
+    // cooldown ledger agrees, and the repeat damper is quiet.
+    if (row.v2 && row.v2.verdict === "go_long" && ledger.longAllowed(row.pair, now) && !ledger.repeatLong(row.pair, now)) {
+      candidates.push("go_long");
+    }
+    if (row.v2 && row.v2.verdict === "go_short" && ledger.shortAllowed(row.pair, now) && !ledger.repeatShort(row.pair, now)) {
+      candidates.push("go_short");
+    }
+
     for (const type of candidates) {
       const key = `${row.pair}:${type}`;
       const last = cooldowns.get(key) ?? 0;
-      if (now - last < SIGNAL_COOLDOWN_MS) continue;
+      const cooldownFor = type === "go_long" || type === "go_short" ? V2.signalRepeatMs : SIGNAL_COOLDOWN_MS;
+      if (now - last < cooldownFor) continue;
       // Direction-adjusted MFE/MAE run from the moment of the signal.
+      const v2Trade = type === "go_long" ? row.v2?.trade ?? null : type === "go_short" ? row.v2?.shortTrade ?? null : null;
       fired.push({
         id: `${row.pair}:${type}:${Math.floor(now / 60_000)}`,
         pair: row.pair,
         base: row.base,
         type,
         direction: DIRECTION[type],
-        score: row.score,
+        score: type === "go_long" ? row.v2?.longScore ?? row.score : type === "go_short" ? row.v2?.shortScore ?? row.score : row.score,
         price: row.price,
         change24h: row.change24h,
         rvol: row.rvol,
@@ -742,6 +881,10 @@ function detectSignals(rows: RadarRow[]): TrackedSignal[] {
         volume24h: row.volume24h,
         note: signalNote(type, row),
         createdAt: now,
+        sl: v2Trade ? v2Trade.stop : null,
+        tp1: v2Trade ? v2Trade.tp1 : null,
+        tp2: v2Trade ? v2Trade.tp2 : null,
+        atrPct: v2Trade ? v2Trade.atrPct : null,
         sentNew: false,
         sent5m: false,
         sent15m: false,
@@ -751,6 +894,10 @@ function detectSignals(rows: RadarRow[]): TrackedSignal[] {
         final: false,
       });
       cooldowns.set(key, now);
+      // Feed the anti-flip-flop ledger.
+      if (BEARISH_TYPES.includes(type)) ledger.bearishSignal(row.pair, now);
+      if (type === "go_long") ledger.longSignal(row.pair, now);
+      if (type === "go_short") ledger.shortSignal(row.pair, now);
       if (fired.length >= MAX_SIGNALS_PER_SCAN) return fired;
     }
   }
@@ -800,6 +947,10 @@ function toApiSignal(s: GradedSignal) {
     volume24h: s.volume24h,
     note: s.note,
     createdAt: new Date(s.createdAt).toISOString(),
+    sl: s.sl ?? null,
+    tp1: s.tp1 ?? null,
+    tp2: s.tp2 ?? null,
+    atrPct: s.atrPct ?? null,
     price5m: s.sent5m ? s.price5m ?? null : null,
     change5m: s.sent5m ? s.change5m ?? null : null,
     price15m: s.sent15m ? s.price15m ?? null : null,
@@ -897,7 +1048,12 @@ function recentSignalsPayload() {
 async function emitPairUpdate(row: RadarRow): Promise<void> {
   const room = `pair:${row.pair}`;
   if (!pairRooms.has(row.pair)) return;
-  const wall = await getAskWall(row.pair, row.price);
+  const known = knownWalls(row.pair);
+  const cached = wallCache.get(row.pair);
+  if (cached && Date.now() - cached.at > WALL_TTL_MS) {
+    // subscribed pair with stale walls — refresh inline (few, paced by rooms)
+    void fetchWalls(row.pair, row.price);
+  }
   io.to(room).emit("pair:update", {
     pair: row.pair,
     base: row.base,
@@ -917,7 +1073,9 @@ async function emitPairUpdate(row: RadarRow): Promise<void> {
     belowHighPct: row.belowHighPct,
     volumeLead: row.volumeLead,
     spikeFalling: row.spikeFalling,
-    askWall: wall,
+    askWall: known.ask,
+    bidWall: known.bid,
+    v2: row.v2,
     spark: row.spark,
     exists: true,
   });
@@ -944,6 +1102,8 @@ async function emitMissingPairUpdate(pair: string): Promise<void> {
     volumeLead: false,
     spikeFalling: false,
     askWall: null,
+    bidWall: null,
+    v2: null,
     spark: [],
     exists: false,
   });
@@ -981,7 +1141,74 @@ async function scan(): Promise<void> {
       return;
     }
 
+    // ── BTC market regime — the filter every long/short answer runs through.
+    const btcRow = rows.find((r) => r.pair === "BTCUSDT") ?? null;
+    if (btcRow) {
+      const mode = btcModeFor(btcRow.change15m) ?? "flat";
+      btcContext = {
+        price: btcRow.price,
+        change5m: btcRow.change5m,
+        change15m: btcRow.change15m,
+        change1h: btcRow.spark.length > 0 ? ((btcRow.price - (btcRow.spark[0] ?? btcRow.price)) / (btcRow.spark[0] ?? btcRow.price)) * 100 : 0,
+        change24h: btcRow.change24h,
+        mode,
+      };
+    }
+
+    // ── V2: the seven-filter assessment, attached to every row. Wall data is
+    // only fetched for the candidates below, so the rest honestly report
+    // "no wall data" in that filter.
     rows.sort((a, b) => b.score - a.score || b.rvol - a.rvol);
+    const subscribed = new Set(pairRooms.keys());
+    const detailRank = new Map<string, number>();
+    rows.forEach((r, i) => detailRank.set(r.pair, i));
+    for (const row of rows) {
+      const known = knownWalls(row.pair);
+      const isStable =
+        STABLE_BASES.has(row.base) ||
+        PEGGED_BASES.has(row.base) ||
+        FIAT_BASES.has(row.base) ||
+        stablecoinLike(row.price, row.change15m, row.change24h);
+      const v2 = assessRow({
+        base: row.base,
+        price: row.price,
+        change1m: row.change1m,
+        change5m: row.change5m,
+        change15m: row.change15m,
+        change24h: row.change24h,
+        vol5mUsd: row.vol5mUsd,
+        rvol: row.rvol,
+        trades5m: row.trades5m,
+        buyPct: row.buyPct,
+        baseScore: row.score,
+        atrPct: row.atrPct,
+        askWall: known.ask,
+        bidWall: known.bid,
+        askWallKnown: known.known,
+        wallBrokenConfirmed: wallBreakState(row.pair, row.price, known.ask),
+        btcChange15m: btcContext?.change15m ?? null,
+        btcChange1h: btcContext?.change1h ?? null,
+        isStablecoin: isStable,
+      });
+      // Keep the payload sane: full checklists + scenarios for the top 20 and
+      // subscribed pairs; scores + verdict + warnings for the long tail.
+      const rank = detailRank.get(row.pair) ?? 999;
+      if (rank > 20 && !subscribed.has(row.pair)) {
+        v2.checks = [];
+        v2.shortChecks = [];
+        v2.scenarios = [];
+        v2.trade = null;
+        v2.shortTrade = null;
+      }
+      row.v2 = v2;
+    }
+
+    // Depth budget goes to the rows that can actually produce a GO verdict.
+    wallCandidates = rows
+      .filter((r) => r.score >= WALL_CANDIDATE_MIN_SCORE || (r.v2 !== null && (r.v2.verdict === "go_long" || r.v2.verdict === "go_short" || r.v2.verdict === "watch")))
+      .slice(0, WALL_CANDIDATE_LIMIT)
+      .map((r) => r.pair);
+
     scans += 1;
     consecutiveFailures = 0;
     lastSnapshot = {
@@ -991,6 +1218,7 @@ async function scan(): Promise<void> {
       clients: io.engine.clientsCount,
       scans,
       stale: bannedUntil > Date.now(),
+      btc: btcContext,
     };
     io.emit("radar:snapshot", lastSnapshot);
 
@@ -1087,6 +1315,7 @@ httpServer.listen(PORT, () => {
     void klinePumpLoop();
     void statsTaskLoop();
     void universeTaskLoop();
+    void wallPumpLoop();
     scheduleNext();
   })();
 });

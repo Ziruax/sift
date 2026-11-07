@@ -19,6 +19,47 @@ const globalForPrisma = globalThis as unknown as {
   prismaPromise?: Promise<PrismaClient | null>;
 };
 
+// ── Serverless bootstrap ────────────────────────────────────────────────────
+//
+// On Netlify the SQLite file lives in the function instance's ephemeral /tmp —
+// brand new (and empty) on every cold start. This DDL mirrors schema.prisma's
+// Signal table exactly; `IF NOT EXISTS` makes it a no-op on hosts where the
+// schema was already pushed (the sandbox dev server).
+
+const SIGNAL_DDL = `
+CREATE TABLE IF NOT EXISTS "Signal" (
+  "id" TEXT NOT NULL PRIMARY KEY,
+  "pair" TEXT NOT NULL,
+  "base" TEXT NOT NULL,
+  "type" TEXT NOT NULL,
+  "direction" TEXT NOT NULL,
+  "score" INTEGER NOT NULL,
+  "price" REAL NOT NULL,
+  "change24h" REAL NOT NULL,
+  "rvol" REAL NOT NULL,
+  "buyPct" REAL NOT NULL,
+  "volume24h" REAL NOT NULL,
+  "note" TEXT,
+  "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "sl" REAL,
+  "tp1" REAL,
+  "tp2" REAL,
+  "atrPct" REAL,
+  "price5m" REAL,
+  "change5m" REAL,
+  "price15m" REAL,
+  "change15m" REAL,
+  "price60m" REAL,
+  "change60m" REAL,
+  "mfe" REAL,
+  "mae" REAL,
+  "status" TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE INDEX IF NOT EXISTS "Signal_createdAt_idx" ON "Signal"("createdAt");
+CREATE INDEX IF NOT EXISTS "Signal_type_idx" ON "Signal"("type");
+CREATE INDEX IF NOT EXISTS "Signal_pair_idx" ON "Signal"("pair");
+`;
+
 /** Resolve the PrismaClient, or null when it cannot run on this host. */
 export function getDb(): Promise<PrismaClient | null> {
   if (globalForPrisma.prisma) return Promise.resolve(globalForPrisma.prisma);
@@ -27,8 +68,15 @@ export function getDb(): Promise<PrismaClient | null> {
     globalForPrisma.prismaPromise = import("@prisma/client")
       .then((mod: PrismaModule) => {
         const client = new mod.PrismaClient({ log: ["error", "warn"] });
-        globalForPrisma.prisma = client;
-        return client as PrismaClient;
+        return client
+          .$executeRawUnsafe(SIGNAL_DDL)
+          .catch(() => {
+            /* schema already exists or the host cannot run DDL — queries will tell */
+          })
+          .then(() => {
+            globalForPrisma.prisma = client;
+            return client as PrismaClient;
+          });
       })
       .catch((error) => {
         console.warn("[db] Prisma unavailable on this host — DB-backed routes degrade gracefully.", error);

@@ -29,6 +29,10 @@ type NewSignalPayload = {
     createdAt: string;
     mfe: number;
     mae: number;
+    sl?: number | null;
+    tp1?: number | null;
+    tp2?: number | null;
+    atrPct?: number | null;
   };
 };
 
@@ -94,6 +98,10 @@ export async function POST(request: Request) {
           createdAt: new Date(s.createdAt),
           mfe: s.mfe,
           mae: s.mae,
+          sl: typeof s.sl === "number" && Number.isFinite(s.sl) ? s.sl : null,
+          tp1: typeof s.tp1 === "number" && Number.isFinite(s.tp1) ? s.tp1 : null,
+          tp2: typeof s.tp2 === "number" && Number.isFinite(s.tp2) ? s.tp2 : null,
+          atrPct: typeof s.atrPct === "number" && Number.isFinite(s.atrPct) ? s.atrPct : null,
           status: "pending",
         },
         update: {

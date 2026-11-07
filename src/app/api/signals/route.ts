@@ -21,6 +21,10 @@ function serialize(row: {
   volume24h: number;
   note: string | null;
   createdAt: Date;
+  sl: number | null;
+  tp1: number | null;
+  tp2: number | null;
+  atrPct: number | null;
   price5m: number | null;
   change5m: number | null;
   price15m: number | null;
@@ -45,6 +49,10 @@ function serialize(row: {
     volume24h: row.volume24h,
     note: row.note,
     createdAt: row.createdAt.toISOString(),
+    sl: row.sl,
+    tp1: row.tp1,
+    tp2: row.tp2,
+    atrPct: row.atrPct,
     price5m: row.price5m,
     change5m: row.change5m,
     price15m: row.price15m,

@@ -14,6 +14,8 @@ import { useLocalSignals, usePairStream } from "@/hooks/use-radar-socket";
 import { PriceChart } from "./price-chart";
 import { PositionTracker, type BotLaunchPrefill } from "./position-tracker";
 import { Pct, SignalTypeChip } from "./primitives";
+import { V2Panel } from "./v2-primitives";
+import type { TradePlan } from "@/lib/market/types";
 
 export type CoinTarget = { kind: "id"; id: string } | { kind: "pair"; pair: string } | null;
 
@@ -118,6 +120,25 @@ export function CoinSheet({
     [onNavigate],
   );
 
+  // V2 trade plan → bot ranges (target zone = TP1..TP2, stop brackets the SL).
+  const launchBotFromPlan = useCallback(
+    (plan: TradePlan) => {
+      launchBot({
+        pair: pair ?? "",
+        base: base || (coin?.symbol ?? ""),
+        investment: 100,
+        entry: plan.entry,
+        direction: plan.side,
+        targetLow: Math.min(plan.tp1, plan.tp2),
+        targetHigh: Math.max(plan.tp1, plan.tp2),
+        stopLow: Math.min(plan.stop * 0.9985, plan.stop),
+        stopHigh: Math.max(plan.stop * 1.0015, plan.stop),
+        note: `V2 ${plan.side} plan — stop ±${plan.riskPct.toFixed(2)}% sized to ${plan.atrPct !== null ? `${plan.atrPct.toFixed(2)}% ATR` : "default risk"}`,
+      });
+    },
+    [launchBot, pair, base, coin?.symbol],
+  );
+
   return (
     <Sheet open={open} onOpenChange={(v) => !v && onClose()}>
       <SheetContent
@@ -186,6 +207,9 @@ export function CoinSheet({
         <div className="flex-1 space-y-4 px-5 py-4">
             {/* Live tracker */}
           <PositionTracker pair={pair} base={base || (coin?.symbol ?? "")} update={update} position={position} onSave={save} onLaunchBot={launchBot} />
+
+          {/* V2 verdict — the seven filters, live for this pair */}
+          {update?.v2 && <V2Panel v2={update.v2} onLaunchBot={launchBotFromPlan} />}
 
           {/* Chart */}
           <PriceChart symbol={coin?.symbol ?? base ?? null} />

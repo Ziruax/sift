@@ -40,7 +40,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
-local-*
 .claude
 .z-ai-config
 *.log
@@ -54,3 +53,14 @@ server.log
 /skills/
 # Local Netlify folder
 .netlify
+
+# Sandbox working artifacts (not part of the app)
+/sift-orig/
+/tool-results/
+/download/
+/upload/
+/examples/
+/TODO
+/pyproject.toml
+/uv.lock
+/mini-services/radar/data/

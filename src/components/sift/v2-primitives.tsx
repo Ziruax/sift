@@ -10,7 +10,7 @@ import { AlertTriangle, ArrowDownRight, ArrowUpRight, Ban, Crosshair, Eye, Landm
 import { useState, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { formatPrice } from "@/lib/market/format";
-import { BTC_MODE_COPY } from "@/lib/market/v2-engine";
+import { BTC_MODE_COPY, V2, suggestedPositionUsd } from "@/lib/market/v2-engine";
 import type { BtcContext, RowVerdict, RadarRowV2, Scenario, TradePlan, V2Check } from "@/lib/market/types";
 
 // ── BTC market regime bar ────────────────────────────────────────────────────
@@ -107,6 +107,7 @@ export function FinalScorePill({ score, verdict, size = "md" }: { score: number;
     : watch
       ? "text-warn border-warn/40 bg-transparent"
       : "text-muted-foreground border-border bg-transparent";
+  const display = Math.min(100, Math.round(score));
   return (
     <span
       className={cn(
@@ -114,9 +115,9 @@ export function FinalScorePill({ score, verdict, size = "md" }: { score: number;
         size === "md" ? "min-w-11 px-1.5 h-7 text-sm" : "min-w-9 px-1 h-6 text-xs",
         tone,
       )}
-      title={`V2 final score ${score} — base score adjusted by momentum, dollar volume, wall and liquidity filters`}
+      title={`uncapped composite ${score} — participation + directional + microstructure axes`}
     >
-      {score}
+      {score > 100 ? "100+" : display}
     </span>
   );
 }
@@ -210,10 +211,12 @@ export function TradePlanCard({
   onLaunchBot?: (plan: TradePlan) => void;
 }) {
   const [amount, setAmount] = useState<number>(investment && investment > 0 ? investment : 100);
+  const [equity, setEquity] = useState<number>(1000);
   const long = plan.side === "long";
   const maxLoss = (amount * plan.riskPct) / 100;
   const tp1Usd = (amount * plan.tp1Pct) / 100;
   const tp2Usd = (amount * plan.tp2Pct) / 100;
+  const sizeUsd = suggestedPositionUsd(equity, plan);
   return (
     <div className={cn("rounded-xl border p-3", long ? "border-up/30 bg-up-soft/40" : "border-down/30 bg-down-soft/40")}>
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -224,8 +227,20 @@ export function TradePlanCard({
             · stop sized to {plan.atrPct !== null ? `${plan.atrPct.toFixed(2)}% ATR` : "default risk"}
           </span>
         </p>
-        <span className="num rounded-md border border-border bg-card px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
-          R:R 1:{plan.riskReward1} → 1:{plan.riskReward2}
+        <span className="flex items-center gap-1.5">
+          <span className="num rounded-md border border-border bg-card px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+            R:R 1:{plan.riskReward1} → 1:{plan.riskReward2}
+          </span>
+          {plan.instrument === "futures" ? (
+            <span
+              className="rounded-md border border-warn/40 px-1.5 py-0.5 text-[10px] font-medium leading-none text-warn"
+              title="This side executes on a margin instrument — funding payments apply while the position is held"
+            >
+              futures/margin instrument — funding applies
+            </span>
+          ) : (
+            <span className="rounded-md border border-border px-1.5 py-0.5 text-[10px] font-medium leading-none text-muted-foreground">spot</span>
+          )}
         </span>
       </div>
 
@@ -249,6 +264,10 @@ export function TradePlanCard({
         ))}
       </div>
 
+      {plan.management && plan.management.length > 0 && (
+        <p className="mt-1.5 text-[11px] leading-snug text-muted-foreground">{plan.management.join(" · ")}</p>
+      )}
+
       {plan.blocked && (
         <p className="mt-2 flex items-start gap-1.5 rounded-lg border border-warn/40 bg-transparent px-2.5 py-1.5 text-[11px] text-warn">
           <ShieldAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
@@ -257,6 +276,24 @@ export function TradePlanCard({
       )}
 
       <div className="mt-2.5 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+        <label className="flex items-center gap-1.5">
+          <span className="num font-mono">Equity $</span>
+          <input
+            type="number"
+            min={1}
+            step={1}
+            value={equity}
+            onChange={(e) => setEquity(Math.max(1, Number(e.target.value) || 1))}
+            className="num w-24 rounded-md border border-border bg-card px-1.5 py-1 font-mono text-[11px] tabular-nums focus-visible:outline-2 focus-visible:outline-ring"
+            aria-label="Account equity in dollars"
+          />
+        </label>
+        <span className="num font-mono" title={`constant dollar risk — position = equity × ${(V2.equityRiskFraction * 100).toFixed(1)}% ÷ stop %`}>
+          → size <span className="font-semibold text-foreground">${Math.max(0, Math.round(sizeUsd)).toLocaleString()}</span> ({(V2.equityRiskFraction * 100).toFixed(1)}% risk)
+        </span>
+      </div>
+
+      <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
         <label className="flex items-center gap-1.5">
           <span className="num font-mono">Risk $</span>
           <input
@@ -318,6 +355,18 @@ export function ScenarioList({ scenarios }: { scenarios: Scenario[] }) {
 
 // ── Full V2 assessment panel (coin sheet, row detail) ────────────────────────
 
+/** Tone for the calibrated hit-rate chip: green ≥ 55%, amber 45–55%, red below. */
+function hitRateTone(p: number): string {
+  if (p >= 0.55) return "border-up/40 text-up";
+  if (p >= 0.45) return "border-warn/40 text-warn";
+  return "border-down/40 text-down";
+}
+
+/** One axis segment's share of its own maximum, as a 0–100% width. */
+function axisPct(value: number, max: number): string {
+  return `${Math.max(0, Math.min(100, (value / max) * 100))}%`;
+}
+
 export function V2Panel({
   v2,
   onLaunchBot,
@@ -344,11 +393,38 @@ export function V2Panel({
         </div>
       </div>
 
+      {v2.axes && (
+        <div
+          role="img"
+          aria-label="score axes"
+          title={`score axes — participation ${Math.round(v2.axes.participation)} / 40, directional ${Math.round(v2.axes.directional)} / 35, microstructure ${Math.round(v2.axes.microstructure)} / 25`}
+        >
+          <div className="flex h-1.5 w-full gap-px overflow-hidden rounded-full bg-muted/50">
+            <div className="bg-up-soft" style={{ width: axisPct(v2.axes.participation, 40) }} />
+            <div className="bg-warn-soft" style={{ width: axisPct(v2.axes.directional, 35) }} />
+            <div className="bg-muted" style={{ width: axisPct(v2.axes.microstructure, 25) }} />
+          </div>
+          <p className="num mt-0.5 font-mono text-[10px] text-muted-foreground">
+            Part {Math.round(v2.axes.participation)} · Dir {Math.round(v2.axes.directional)} · Micro {Math.round(v2.axes.microstructure)}
+          </p>
+        </div>
+      )}
+
       <WarningsRow warnings={v2.warnings} />
 
       <div className="space-y-1.5 rounded-lg border border-border bg-muted/30 p-2.5">
         <p className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">Sell wall (asks within +2%)</p>
         <WallLine wall={v2.wall} known={v2.wallKnown} broken={v2.wallBroken} />
+        {v2.wall !== null && v2.wallAgeSec != null &&
+          (v2.wallAgeSec >= 60 ? (
+            <span className="text-[11px] text-muted-foreground" title="the wall has persisted past the 60-second spoof-discount window">
+              aged {Math.round(v2.wallAgeSec)}s — real
+            </span>
+          ) : (
+            <span className="text-[11px] text-warn" title="walls younger than 60 seconds count half — possibly a spoof">
+              fresh — possible spoof
+            </span>
+          ))}
         {v2.bidWall !== null && (
           <>
             <p className="mt-1 text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">Bid floor (bids within −2%)</p>
@@ -361,6 +437,45 @@ export function V2Panel({
           </>
         )}
       </div>
+
+      {(v2.hitRate != null || v2.futures != null) && (
+        <div className="flex flex-wrap items-center gap-1.5" aria-label="Signals">
+          {v2.hitRate != null && v2.hitRate.n > 0 && (
+            <span
+              className={cn("num rounded-md border px-1.5 py-0.5 font-mono text-[10px] font-medium leading-none", hitRateTone(v2.hitRate.p))}
+              title={`empirical P(TP1 before stop) for this score band, from your own backtest calibration (n=${v2.hitRate.n} decided trades)`}
+            >
+              est. {(v2.hitRate.p * 100).toFixed(0)}% TP1-first (n={v2.hitRate.n})
+            </span>
+          )}
+          {v2.futures?.oiChange15m != null && (
+            <span
+              className="num rounded-md border border-border bg-muted/40 px-1.5 py-0.5 font-mono text-[10px] leading-none text-muted-foreground"
+              title="Perpetual open-interest change over the last 15 minutes — real money entering or leaving"
+            >
+              OI 15m {v2.futures.oiChange15m >= 0 ? "+" : ""}
+              {v2.futures.oiChange15m.toFixed(2)}%
+            </span>
+          )}
+          {v2.futures?.fundingRatePct != null && (
+            <span
+              className="num rounded-md border border-border bg-muted/40 px-1.5 py-0.5 font-mono text-[10px] leading-none text-muted-foreground"
+              title="Perpetual funding rate per 8 hours — above +0.05% crowds longs, below −0.05% crowds shorts"
+            >
+              funding {v2.futures.fundingRatePct >= 0 ? "+" : ""}
+              {v2.futures.fundingRatePct.toFixed(3)}%/8h
+            </span>
+          )}
+          {v2.futures?.lsRatio != null && (
+            <span
+              className="num rounded-md border border-border bg-muted/40 px-1.5 py-0.5 font-mono text-[10px] leading-none text-muted-foreground"
+              title="Long/short account ratio on perpetuals — crowd positioning"
+            >
+              L/S {v2.futures.lsRatio.toFixed(2)}
+            </span>
+          )}
+        </div>
+      )}
 
       {plan && <TradePlanCard plan={plan} onLaunchBot={onLaunchBot} />}
       {shortPlan && v2.shortVerdict === "go" && <TradePlanCard plan={shortPlan} onLaunchBot={onLaunchBot} />}

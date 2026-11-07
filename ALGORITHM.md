@@ -1,20 +1,37 @@
-# Sift — Complete Algorithm Reference
+# Sift — Complete Algorithm Reference (V2.1, post-audit)
 
-> **What this document is.** A full, honest description of every algorithm inside
-> Sift V2: how data is captured, how each metric is derived, how the Base Score is
-> built, how the seven V2 filters combine into a Final Score, how trade plans
-> (entry / stop / TP1 / TP2 ranges) are constructed for both longs and shorts,
-> how scenarios are generated *before* the decision, how signals are cooled down
-> so they never flip-flop, how every signal is graded after the fact, and how the
-> backtest proves (or disproves) the whole stack. Written so you can audit each
-> threshold and judge the logic yourself.
+> **What this document is.** A full, honest description of every algorithm
+> inside Sift V2.1: how the universe is selected, how each metric is derived,
+> how the three-axis score is built, how the hard gates veto, how trade plans
+> (entry / stop / TP1 / TP2) are constructed for both longs and shorts, how
+> scenarios are generated *before* the decision, how signals are cooled down,
+> how every signal is graded after the fact, and how the backtest measures (or
+> fails to measure) all of it. Written so you can audit each threshold and
+> judge the logic yourself.
 >
-> **The honesty contract first.** No filter set makes crypto predictable. Sift V2
-> does not promise accuracy — it refuses obviously fake setups, sizes risk to the
-> coin's own volatility, and shows the scenario map before every decision. The
-> design target is *edge*, not certainty: stop at ~1–1.6%, take profits at 2× and
-> 3.5× that, so at even ~55–60% win rate the math is profitable
-> (`0.6 × (+2.0) − 0.4 × (−1.0) = +0.8R per trade` at TP1-only exits).
+> **What changed in V2.1.** An external algorithm audit found three outright
+> bugs (a blacklist that silently killed JUP/BNB/SHIB/ARB; a volume baseline
+> that included its own spike and ignored time-of-day; an ATR clamp that
+> inverted the risk geometry), ~6 design decisions that capped the achievable
+> edge (double-counted momentum, two near-constant filters, absolute
+> thresholds on non-stationary series, no beta adjustment, a capped score that
+> destroyed ranking, an un-tunable wall filter), and one validity problem (a
+> backtest that could not measure what it claimed). This version fixes all of
+> them. Every fix is marked **[AUDIT §x.y]** so you can trace cause → change.
+>
+> **The honesty contract first — and now measured.** No filter set makes
+> crypto predictable. As part of this revision the entire engine was replayed
+> over **90 days of real 5m bars, net of costs, with pessimistic grading**
+> (§8.2). The measured result: the momentum-chasing GO family wins its
+> TP1-before-stop race only **20–38% of the time by score band** (it needs
+> ~42%+ after costs) — i.e. the last 90 days do **not** pay for this signal
+> family on any threshold tested. Sift therefore ships an **expectancy gate**
+> (§8.3): the engine refuses to say "GO" when the calibrated hit rate of the
+> score band implies negative net expectancy, and shows the numbers instead.
+> When you run a backtest on a kinder window and your score band measures
+> ≥ ~42–45% hit rate, GOs re-open automatically. That is what "capture real
+> opportunities" honestly means: refuse the fake ones, measure everything,
+> and recalibrate from evidence — not promises.
 
 ---
 
@@ -22,601 +39,871 @@
 
 1. [System architecture — the three tiers](#1-system-architecture--the-three-tiers)
 2. [Data acquisition](#2-data-acquisition)
-3. [Per-coin derived metrics (the RadarRow)](#3-per-coin-derived-metrics-the-radarrow)
-4. [Base Score — the 100-point pump model](#4-base-score--the-100-point-pump-model)
-5. [V2 engine — the seven filters](#5-v2-engine--the-seven-filters)
-6. [Final Score & verdict thresholds](#6-final-score--verdict-thresholds)
+3. [Universe selection — volume anomaly, not absolute volume](#3-universe-selection--volume-anomaly-not-absolute-volume)
+4. [Per-coin derived metrics (the RadarRow)](#4-per-coin-derived-metrics-the-radarrow)
+5. [The volume baseline — time-of-day adjusted, self-excluded, floored](#5-the-volume-baseline--time-of-day-adjusted-self-excluded-floored)
+6. [The three-axis score](#6-the-three-axis-score)
 7. [Hard gates — what a GO must survive](#7-hard-gates--what-a-go-must-survive)
-8. [Trade plans — entry / stop / TP ranges (long & short)](#8-trade-plans--entry--stop--tp-ranges-long--short)
-9. [Scenario analysis — before the decision](#9-scenario-analysis--before-the-decision)
-10. [Signal system & anti-flip-flop cooldowns](#10-signal-system--anti-flip-flop-cooldowns)
-11. [Outcome grading — accountability loop](#11-outcome-grading--accountability-loop)
-12. [Backtest — proving the filters](#12-backtest--proving-the-filters)
-13. [Bots & FreeCryptoAPI integration](#13-bots--freecryptoapi-integration)
-14. [Reliability engineering](#14-reliability-engineering)
-15. [Complete tunables table](#15-complete-tunables-table)
-16. [Worked examples](#16-worked-examples)
-17. [Known limitations (honest list)](#17-known-limitations-honest-list)
+8. [Verdict thresholds & the uncapped score](#8-verdict-thresholds--the-uncapped-score)
+9. [Trade plans — constant-R geometry, constant dollar risk](#9-trade-plans--constant-r-geometry-constant-dollar-risk)
+10. [New signals — OI, funding, L/S ratio, CVD, trade-size skew, wall age](#10-new-signals--oi-funding-ls-ratio-cvd-trade-size-skew-wall-age)
+11. [Scenario analysis & backtest calibration](#11-scenario-analysis--backtest-calibration)
+12. [Signal system, anti-flip-flop cooldowns & the portfolio layer](#12-signal-system-anti-flip-flop-cooldowns--the-portfolio-layer)
+13. [Outcome grading — accountability loop](#13-outcome-grading--accountability-loop)
+14. [Backtest — the honest edition](#14-backtest--the-honest-edition)
+15. [Bots & FreeCryptoAPI integration](#15-bots--freecryptoapi-integration)
+16. [Reliability engineering](#16-reliability-engineering)
+17. [Complete tunables table (tuned vs assumed)]#17-complete-tunables-table-tuned-vs-assumed)
+18. [Worked examples](#18-worked-examples)
+19. [Known limitations (honest list)](#19-known-limitations-honest-list)
 
 ---
 
 ## 1. System architecture — the three tiers
 
-One shared brain (`src/lib/market/v2-engine.ts`), three data consumers:
+One shared brain, three data consumers:
 
 | Consumer | Where | Role |
 |---|---|---|
-| **Server scanner** | `mini-services/radar/index.ts` (port 3003 socket.io / 3004 REST) | Scans 24/7 server-side whether or not any browser is open. One scanner serves every connected client — N visitors cost the Binance API the same as one. |
-| **In-browser engine** | `src/lib/market/local-radar.ts` | Binance **public websockets** (`!ticker@arr` + per-pair `aggTrade`) — no key, no server. This is what runs on static hosting (Netlify). |
-| **Backtest simulator** | `src/components/sift/backtest-view.tsx` + `scripts/tune-v2.ts` | Replays 30 days of 5m candles through the *exact same* filter functions. |
+| **Server scanner** | `mini-services/radar/index.ts` (port 3003 socket.io / 3004 REST) | Scans 24/7 server-side whether or not any browser is open. One scanner serves every connected client. |
+| **In-browser engine** | `src/lib/market/local-radar.ts` | Binance **public websockets** (`!miniTicker@arr` + per-pair `aggTrade`) — no key, no server. This is what runs on static hosting (Netlify). |
+| **Backtest simulator** | `src/components/sift/backtest-view.tsx` + `scripts/tune-v2.ts` | Replays history through the *exact same* filter functions. |
+
+Shared pure logic lives in two modules so all three tiers compute identical
+numbers: `src/lib/market/v2-engine.ts` (scoring, gates, plans, backtest) and
+`src/lib/market/baseline.ts` (blacklist, baselines, book analysis, beta, CVD).
 
 The browser picks its tier automatically (upgrade path, best wins):
+`live` (socket.io) → `fallback` (REST poll) → `local` (in-browser engine).
 
-```
-1. "live"      socket.io → server scanner            (best)
-2. "fallback"  REST poll /api/radar every 6s         (websocket blocked)
-3. "local"     in-browser websocket engine           (no backend at all)
-```
-
-A fast probe (~800 ms after mount) decides the tier; if the server scanner
-reappears later, the app upgrades back to tier 1 automatically.
-
-**Why one engine module for everything:** the old V1 app graded a coin on a
-single 0–100 score and was right ~30% of the time. V2 refuses to speak unless
-seven independent filters agree — and the backtest replays the *same code*, so
-what you test is what you trade.
+**Why one engine module for everything:** what you backtest is what you trade.
+The audit's single largest structural complaint about most retail systems —
+"the backtest tests different code than the live system" — is impossible here
+by construction.
 
 ---
 
 ## 2. Data acquisition
 
-### 2.1 Universe selection (what gets scanned at all)
-
-Every 5 minutes the scanner pulls Binance's full `/api/v3/ticker/24hr` and:
-
-1. Keeps only `*USDT` pairs.
-2. **Blacklists** (these can never pump — the single biggest V1 fake-signal source):
-
-| Category | Members |
-|---|---|
-| Stablecoins | USDT, USDC, FDUSD, DAI, TUSD, USDP, BUSD, BFUSD, USDS |
-| Fiat pairs | EUR, GBP, BRL, AUD, TRY, NGN, UAH, ARS, MXN, ZAR, PLN, CZK, HUF, ILS |
-| Pegged assets | RLUSD, USD1, USDE, USD0, PYUSD, EURC, USDD, FRAX, LUSD, GUSD, XUSD, RWUSD, XAUT, PAXG |
-| Leveraged tokens | any base ending UP / DOWN / BULL / BEAR |
-| B-stock symbols | 3–6 char bases ending in `B` (Binance regional units) |
-
-3. Sorts by 24h quote volume (USD), takes the **top 40**.
-4. Forces `BTCUSDT` + `ETHUSDT` into the universe (BTC feeds the market-regime
-   filter; ETH is the liquidity bellwether).
-5. User-subscribed pairs (open coin sheets) ride along on top of the 40.
-
-### 2.2 Server scanner — paced data tasks (anti-burst design)
-
-The V1 design fired ~60 requests in a burst every 5 s and got IP-banned. V2 runs
-four background tasks that pace requests one at a time:
+### 2.1 Server scanner — paced data tasks (anti-burst design)
 
 | Task | Cadence | Fetches |
 |---|---|---|
-| `klinePumpLoop` | 1 pair per pace-tick, rotating | `/api/v3/klines?interval=1m&limit=60` (one hour of 1m candles) |
-| `statsTaskLoop` | every 60 s, batched | `/api/v3/ticker/24hr?symbols=[...universe]` — one request for all pairs |
-| `universeTaskLoop` | every 5 min | full ticker → re-rank the top-40 |
-| `wallPumpLoop` | 1 pair per 2.5 s | `/api/v3/depth?limit=20` for wall candidates only |
+| `klinePumpLoop` | 1 pair per pace-tick, **priority rotation** | `/api/v3/klines?interval=1m&limit=288` (24h of candles) |
+| `statsTaskLoop` | every 30 s, batched | `/api/v3/ticker/24hr?symbols=[...universe]` |
+| `universeTaskLoop` | every 5 min | full ticker → re-rank the universe (§3) |
+| `wallPumpLoop` | 1 pair per 2.5 s | `/api/v3/depth?limit=100` for wall candidates only |
+| `futuresLoop` | 1 pair per 2.5 s | OI history, funding, long/short ratio (§10) |
+| listing-age probe | once per pair on universe entry | `/api/v3/klines?interval=1d&limit=1&startTime=0` → first-ever candle |
 
-The **scan itself is pure computation over the in-memory stores — zero network.**
-It runs every 5 s (server) / 1 s (browser engine).
+**[AUDIT §5.4] Priority rotation:** the kline pump serves *hot* pairs (score
+≥ watch bar, or rvol ≥ 2, or user-subscribed) every rotation tick, and *cold*
+pairs only every 3rd tick — same request budget, freshness where it counts.
+The old round-robin gave every pair equal priority forever, which meant 6
+minutes per full rotation exactly during the highest-volume windows.
 
-### 2.3 Adaptive rate limiting (shared-IP survival)
+**[AUDIT §7 note] 24h change from candles, not the ticker:** the day-extension
+gate reads `(lastClose − klines[0].open)/klines[0].open` from the 288-candle
+window — never the up-to-60s-stale ticker field.
 
-Every Binance response carries `x-mbx-used-weight-1m` (the shared egress IP's
-window usage). The scanner reads it and adapts its request pace:
+The **scan itself is pure computation over the in-memory stores — zero
+network.** It runs every 5 s (server) / 1 s (browser engine).
+
+### 2.2 Adaptive rate limiting (shared-IP survival)
+
+Every Binance response carries `x-mbx-used-weight-1m`. The scanner adapts:
 
 | Window weight | Pace |
 |---|---|
-| < 1200 | 160 ms between requests (brisk) |
-| < 2500 | 450 ms (normal) |
-| < 4000 | 1400 ms (crowded) |
+| < 1200 | 160 ms between requests |
+| < 2500 | 450 ms |
+| < 4000 | 1400 ms |
 | ≥ 4000 | 9000 ms (stand aside) |
 
-A 418/429 (ban) triggers a hard quiet period starting at 5 min, **doubling** on
-repeats up to 40 min; 30 min of clean operation resets it. Hosts fail over:
-`data-api.binance.vision` → `api.binance.com` → `api4.binance.com`.
+418/429 → hard quiet starting at 5 min, doubling to 40 min; 30 min clean
+resets it. Host failover: `data-api.binance.vision` → `api.binance.com` →
+`api4.binance.com`.
 
-### 2.4 Browser engine — websocket data path
+### 2.3 Browser engine — websocket data path
 
 | Stream | Content | Use |
 |---|---|---|
-| `!ticker@arr` | all USDT pairs' 24h stats, pushed ~1/s | price, 24h change, universe ranking |
-| `<pair>@aggTrade` | every trade on universe pairs | tick-level price, taker buy %, trade counts |
-| REST klines (once) | one hour of 1m candles per pair | baseline volume, momentum bootstrap |
+| `!miniTicker@arr` | all USDT pairs' 24h stats, ~1/s | price, 24h high, universe ranking input |
+| `<pair>@aggTrade` | every trade on universe pairs | tick-level price, taker buy %, trade counts, CVD, trade-size distribution |
+| REST klines (once per pair) | **24h of 1m candles** (limit 288) | baseline volume bootstrap, momentum, ATR |
+| REST batched ticker (5 min) | `/api/v3/ticker/24hr?symbols=[top 100]` | 24h trade-count floor for the universe |
+| REST depth (paced queue) | `limit=100` for candidates | walls, spread, depth-at-TP |
+| REST futures (best-effort, paced) | fapi.binance.com | OI / funding / L/S (§10) |
 
-Prices are therefore **tick-level** in the browser tier — faster than the 5 s
-REST cadence of the server tier. Both compute identical rows.
+Prices are tick-level in the browser tier. Both tiers compute identical rows.
 
-### 2.5 Order-book walls (the expensive filter)
+### 2.4 Order-book walls
 
-Depth requests are budgeted: only the **top 12 candidates** (score ≥ 50 or any
-row already at `go_long` / `go_short` / `watch`) plus user-subscribed pairs get
-their book fetched, one pair per 2.5 s.
+Depth requests are budgeted to the **top 12 candidates** (score ≥ 50, or any
+`go`/`watch` row) plus user-subscribed pairs, one pair per 2.5 s, `limit=100`
+(**[AUDIT §7]** — top-20 hides walls deeper in the book; 100 costs more weight
+but only for candidates). From each snapshot:
 
-- Wall data older than **75 s** is reported as *"no data"* (honest) rather than stale.
-- Target refresh: every **25 s**.
-- **Ask wall** = largest single ask level (price × qty in USD) within **+2%** of price.
-- **Bid wall** = same within **−2%**.
+- **Ask wall** = largest single ask level (price × qty, USD) within the scan
+  band (±2% of price).
+- **Bid wall** = same below.
+- **Spread** = `(bestAsk − bestBid)/mid × 10 000` bps.
+- **Depth-at-TP** = cumulative asks from price to +7% (the TP2 runway zone).
+- **Wall age** = how long the same price level has persisted across snapshots
+  (±0.05% tolerance) — see §10.
+- Wall data older than **75 s** is reported as *"no data"* (honest), never
+  guessed.
 
-**Wall-break confirmation:** when price crosses above a wall, the break only
-counts after price **holds above it for 2 full minutes** (`wallConfirmMs`).
-If the tracked wall level moves by >0.1%, tracking resets. This kills the
-"price wicked through and instantly dumped back" fake breakout.
+**Wall-break confirmation (kept from V2 — the audit liked it):** a break only
+counts after price **holds above the wall 2 full minutes**; a moved wall
+resets tracking. Kills the wick-through-and-dump fake breakout.
 
 ---
 
-## 3. Per-coin derived metrics (the RadarRow)
+## 3. Universe selection — volume anomaly, not absolute volume
 
-All metrics are computed from the last hour of 1m candles (60 bars) — refreshed
-continuously. From candle arrays `closes[]`, `quotes[]` (USD volume), `trades[]`,
-`takerBuys[]` (USD taker-buy volume):
+**[AUDIT §2.2 — critical]** The old universe was the top-40 pairs by
+*absolute* 24h volume: BTC, ETH, SOL, XRP, DOGE… — large caps that
+structurally cannot pump 3% in an hour. That pointed a pump detector at the
+least pump-prone assets on the exchange.
+
+The V2.1 universe ranks by **volume anomaly** — "money is arriving *here*,
+*now*":
+
+```
+anomaly(pair) = 24h quote volume / median(24h quote volume of the same pair
+                                                over the last 7 days)
+```
+
+Every 5 minutes:
+
+1. Keep `*USDT` pairs; apply the fixed blacklist (§3.1).
+2. Hard liquidity floors: **24h quote volume ≥ $2,000,000** and
+   **24h trade count ≥ 5,000** (the trade-count floor needs the batched
+   ticker; if that call fails the floor is honestly skipped for that round).
+3. Rank by anomaly (pairs with < 2 history samples get anomaly 1 and rank
+   after, by absolute volume — so a fresh install starts as the old
+   behavior and converges to anomaly ranking within a day).
+4. Take the **top 60** (was 40 — the anomaly metric is meaningless on a
+   40-coin pool dominated by anchors).
+5. `BTCUSDT` + `ETHUSDT` always ride along (BTC feeds the regime filter).
+
+**History persistence:** one snapshot per pair per 3-hour bucket, 56 samples
+(7 days), capped to ~400 highest-volume pairs. Server: JSON file
+(`mini-services/radar/data/vol-history.json`); browser: localStorage
+(`sift:volhist:v1`). Median-based, so a single weird snapshot can't poison it.
+
+### 3.1 The fixed blacklist **[AUDIT §2.1 — critical bug fix]**
+
+The old rules — "any base ending UP/DOWN/BULL/BEAR" and "3–6 char bases
+ending in B" — were substring heuristics that silently killed **JUP** (ends
+"UP"), **BNB, SHIB, ARB, CKB, DGB** (end "B"). Binance's leveraged tokens are
+delisted, so those rules produced *only* false negatives. V2.1 uses exact
+matches only:
+
+| Category | Rule |
+|---|---|
+| Stablecoins | exact set: USDT, USDC, FDUSD, DAI, TUSD, USDP, BUSD, BFUSD, USDS |
+| Fiat pairs | exact set: EUR, GBP, BRL, AUD, TRY, … (16 members) |
+| Pegged assets | exact set: RLUSD, USD1, USDE, USD0, PYUSD, EURC, … (17 members) |
+| Leveraged tokens | exact set (BTCUP, ETHDOWN, …) + the pattern `^[A-Z0-9]+[1-5](L|S)$` (BTC3L-style) |
+
+AUDIO no longer dies (fiat list is exact-match, not prefix). The B-stock rule
+is deleted outright.
+
+---
+
+## 4. Per-coin derived metrics (the RadarRow)
+
+All metrics are computed from the last **24h of 1m candles** (288 bars)
+**[AUDIT §2.3 — was 60 bars]**:
 
 | Metric | Formula | Meaning |
 |---|---|---|
-| `change1m` | `(closes[last] − closes[last−1]) / closes[last−1] × 100` | last minute move |
-| `change5m` | same over 5 bars | short impulse |
-| `change15m` | same over 15 bars | the trend the move lives in |
-| `change24h` | from 24h ticker | day-extension gate |
-| `vol5mUsd` | Σ quotes of last 5 bars | **real dollars** traded in 5m |
-| `volAvg5mUsd` | mean of twelve 5m blocks over the prior hour | baseline |
-| `rvol` | `vol5mUsd / volAvg5mUsd` | relative volume ("3.0×" = 3× the coin's own average) |
-| `trades5m` | Σ trades of last 5 bars | **participation** — one whale print vs a crowd |
-| `tradeSpike` | `trades5m / avg trades per 5m block` | trade-count expansion |
-| `buyPct` | `Σ takerBuys(last 5) / vol5mUsd × 100` | % of tape that was taker-buying |
-| `closeStrength` | mean of `(close − low) / (high − low)` over last 5 candles | buyers paying up into strength (flat candle = 0.5 neutral) |
-| `sessionHigh` | running max since scan start (+ candle highs) | dump detector base |
-| `belowHighPct` | `(sessionHigh − price) / sessionHigh × 100` | how far off the high |
-| `atrPct` | 14-period ATR on 1m candles, as % of price | per-coin volatility for stop sizing |
+| `change1m/5m/15m` | close-to-close over 1/5/15 bars | impulse |
+| `change24h` | from the 288-bar window (server) / 24h ticker (browser) | day-extension gate |
+| `vol5mUsd` | Σ quote volume of last 5 bars | real dollars |
+| `volAvg5mUsd` | **time-of-day adjusted median baseline** (§5) | what "normal" means *now* |
+| `rvol` | `vol5mUsd / volAvg5mUsd` | expansion vs the coin's own clock-time norm |
+| `trades5m` | Σ trades of last 5 bars | participation |
+| `tradeSpike` | median-based trades-per-5m-block ratio | trade-count expansion |
+| `buyPct` | `Σ takerBuyQuote(last 5) / vol5mUsd × 100` | taker-buy share |
+| `closeStrength` | **range-weighted** `(c−l)/(h−l)` over last 5 bars (§6.3) | buyers paying up |
+| `sessionHigh` | rolling 24h high from candles/ticker (**[AUDIT §2.6]** — was process-local) | dump detector base |
+| `belowHighPct` | `(sessionHigh − price)/sessionHigh × 100` | distance from high |
+| `atrPct` | 14-period ATR on 1m candles, % | per-coin noise for stop sizing |
+| `beta` | rolling coin-vs-BTC regression (§6.2) | market sensitivity |
+| `residChange5m/15m` | `change − β × btcChange` | idiosyncratic move |
+| `cvdSlope15m` | `Σ(takerBuy − takerSell)/Σvol` over 15m | net aggressor direction |
+| `avgTradeSizeSpike` | avg trade size 5m vs baseline median | whale-vs-crowd |
+| `listingAgeDays` | days since the pair's first Binance candle | new-listing veto |
 
-**The two traps this row design kills:**
-
-- *Volume multiple without dollars.* V1 showed "3.0× volume" — but 3× of almost
-  nothing is nothing. V2 shows the **USD figure** and gates on it (`vol5mUsd`).
-- *Buyer % without trade count.* 97% buyers on 76 trades is one whale painting
-  the tape, not a crowd. V1 missed it; V2 penalizes it (liquidity filter + fake-buyer trap).
+**Session-high fix detail [AUDIT §2.6]:** the old `sessionHighs` map lived in
+process memory — a restart at noon reset `belowHighPct` to 0 and every
+"dumping" flag vanished for hours. V2.1 derives the high from the 24h data
+itself (candle highs server-side, the miniTicker 24h-high browser-side), so a
+restart cannot lie.
 
 ---
 
-## 4. Base Score — the 100-point pump model
+## 5. The volume baseline — time-of-day adjusted, self-excluded, floored
 
-This is the *starting* score the V2 filters then modify. Computed identically in
-the server scanner, browser engine, and backtest:
+**[AUDIT §2.3 — critical]** The old baseline was the *mean of twelve 5m
+blocks over the prior hour*, which (a) included the spike block itself — a
+genuine 5× print got divided by a baseline inflated by its own tail — and
+(b) ignored time of day: 03:00 UTC volume is 10–30% of 15:00 UTC volume on
+most alts, so quiet-hour tapes constantly read as 4× "spikes" that were
+merely normal-for-the-clock. This was the single largest source of false
+positives.
 
-| Component | Rule | Points |
+The V2.1 baseline (`volumeBaseline()` in `baseline.ts`), computed over the
+prior 24h of 5m blocks:
+
+```
+usable   = blocks minus the last 6 (30 min)          # self-exclusion
+refHour  = UTC hour-of-day of the newest block
+sameHour = usable blocks whose hour-of-day == refHour
+base     = median(sameHour)   if |sameHour| ≥ 6      # time-of-day control
+         = median(usable)     otherwise              # honest fallback
+floor    = mean(usable) / 20                          # new-listing guard
+baseline = max(base, floor)
+rvol     = vol5m / baseline
+```
+
+- **Median, not mean** — one fat block can't drag the baseline up.
+- **Self-exclusion** — the 30 minutes being measured never enter their own
+  denominator.
+- **Same-hour-of-day** — 03:00 is compared to 03:00. With only 24h of data
+  this is the minimum viable control; persisting 7 days of blocks would give
+  the full same-slot median, and the interface already supports it.
+- **The floor** — a freshly listed pair with a ~0 median divides by mean/20,
+  capping rvol at 20 instead of infinity.
+- **`historyBlocks`** — the usable block count is passed to the engine; below
+  20 blocks the *history* hard gate refuses a GO ("volume baseline not
+  trusted yet"). No more infinite-rvol listings sneaking through.
+
+---
+
+## 6. The three-axis score
+
+**[AUDIT §3.1]** The old Final Score was `Base(0–100) + momentum pts +
+volume pts + wall pts + liquidity pts` — but the base score itself already
+contained 25 points of momentum, the momentum filter added 15 more, and the
+day-extension gate re-tested the same thing a third time. Momentum was
+double- and triple-counted, so a fast mover with weak volume outranked a
+genuine volume-led setup. Two filters were also near-constants: "+15 no wall
+within 2%" was true on almost every book (zero discriminative power, pure
+inflation), and "+5 for ≥500 trades" was trivially true for every top pair.
+
+V2.1 replaces the pile with **three orthogonal measurement families**, each
+capped, summing to a 0–100 composite that is **uncapped internally** (§8):
+
+### 6.1 Axis A — Participation (0–40): *is the crowd here?*
+
+| Component | Points | Formula |
 |---|---|---|
-| **RVOL spike** | `30 × clamp01((rvol − 1) / 4)` → 1× = 0 pts, 5×+ = 30 pts | 0–30 |
-| **Trade spike** | `10 × clamp01((tradeSpike − 1) / 4)` — volume spike without a trade spike is one whale print | 0–10 |
-| **Momentum** | 1m > 0 **and** 5m > 0 **and** 15m > 0 | +10 |
-| | 5m > 0 **and** 5m ≥ 15m (accelerating) | +8 |
-| | 1m > 0 **and** 1m ≥ 5m (still accelerating) | +7 |
-| **Buy pressure** | `20 × clamp01((buyPct − 50) / 30)` → 50% = 0, 80%+ = 20 | 0–20 |
-| **Close strength** | `15 × closeStrength` | 0–15 |
+| rvol | 25 | `25 × clamp01((rvol − 1)/4)` — 1× = 0, 5×+ = full |
+| tradeSpike | 10 | `10 × clamp01((tradeSpike − 1)/4)` |
+| absolute dollars | 5 | `5 × clamp01(vol5mUsd / 200k)` |
 
-`Base Score = min(100, round(rvolPts + tradePts + momentumPts + buyPts + closePts))`
+### 6.2 Axis B — Directional pressure (0–35): *which way, net of market?*
 
-Badges derived from it: `pumped` (day > +8%), `pump` (score ≥ 80),
-`dumping` (≥3% below session high), `early` (rvol ≥ 3, day between −5% and +8%).
+| Component | Points | Formula |
+|---|---|---|
+| residual 5m | 12 | `12 × clamp01(resid5m / bar5)` |
+| residual 15m | 8 | `8 × clamp01(resid15m / bar15)` |
+| taker flow | 10 | `10 × clamp01((buyPct − 50)/25)` |
+| CVD slope | 5 | `5 × clamp01((cvd × dir + 0.15)/0.5)` |
 
----
+**[AUDIT §3.3/§3.4] Two structural changes live here:**
 
-## 5. V2 engine — the seven filters
+1. **ATR-normalized bars.** `bar5 = max(0.15%, 0.5 × atr5m)` where
+   `atr5m = atr1m × √5`. A 0.05%-ATR stable-ish coin needs a visible tick; a
+   2%-ATR memecoin needs a real impulse. The same for 15m (`√15`). One
+   threshold set now survives quiet coins, normal coins, and violent coins —
+   the audit's requirement for regime-proof thresholds.
+2. **Residual momentum.** When β is computable (rolling 60-bar regression of
+   coin 1m returns on BTC 1m returns, clamped [0.1, 3]),
+   `resid = change − β × btcChange`. A coin up 0.5% while BTC is up 0.5% has
+   *zero* idiosyncratic strength — the old engine scored it as if the coin
+   were doing the work. Raw moves are used only when β is unavailable.
 
-The V1 failure mode was *one number decides*. V2 requires seven independent
-checks to agree before any GO verdict. Each filter contributes **points** to the
-Final Score; some also act as **hard blocks**.
+**CVD divergence is a hard note here too:** price up over 15m while CVD slope
+is negative = absorption/distribution — the check flips to fail and the
+scenario map warns (§11). This is the single best short-term warning in the
+free data set, and the raw aggTrade stream already had it.
 
-### Filter 1 — Momentum (the tape must be green, and staying green)
+### 6.3 Axis C — Microstructure (0–25 + penalties): *can the move actually travel?*
 
-| Condition | Effect |
+| Component | Points | Formula |
+|---|---|---|
+| close strength | 10 | range-weighted (below), × direction |
+| wall quality | +8/+10/−15/−7 | relative scoring (below) |
+
+**Range-weighted close strength [AUDIT §4]:** a tight doji and a wide
+impulse candle used to count equally. Now each of the last 5 closed bars
+contributes `0.5 + (raw − 0.5) × w` where `raw = (c−l)/(h−l)` (0.5 when
+`h == l` — the old division-by-zero guard, kept) and
+`w = min(1, range%/(2 × atr1m%))`. Only candles with meaningful range move
+the score.
+
+**Relative wall scoring [AUDIT §3.2]:**
+
+| Situation | Points |
 |---|---|
-| 5m > +0.40% **and** 15m > +0.40% | **+15** |
-| 5m < 0 **or** 15m < 0 (tape red) | **−20** |
-| 1m < −0.10% (already rolling over) | extra **−10** |
+| No wall in the scan band | **+8** (modest runway — *not* the old free +15) |
+| Price beyond the wall (broken, confirmed by the 2-min hold) | **+10** |
+| Wall > 1× **one-sided taker flow** and aged ≥ 60 s | **−15**, "cannot break" |
+| Wall > 1× taker flow but younger than 60 s | **−7**, "half weight — possible spoof" |
+| Book not fetched | 0, honestly "no data" |
 
-Tuned by grid search over 14 days of 5m candles: the +0.4% impulse requirement
-fires 3× fewer trades at a *better* win rate than a weaker drift threshold.
+Two changes matter here. First, the wall is compared to **one-sided taker
+flow** (buy flow for ask walls: `vol5m × buyPct/100`) instead of two-sided
+tape — an ask wall is eaten by buyers, not by the full tape. Second, **wall
+age** discounts walls that appeared seconds ago (probably spoofed) until
+they persist a minute. The old engine treated a 5-second spoof and an
+8-minute real wall identically.
 
-### Filter 2 — Real dollar volume
+**Penalties (subtract from the composite):**
 
-| Condition | Effect |
+| Condition | Penalty |
 |---|---|
-| 5m volume > $100,000 | **+10** |
-| 5m volume < $50,000 | **−20** |
+| trades5m < 200 | −20 (liquidity floor) |
+| spread > 15 bps | −10 (exits pay the spread) |
+| buyPct > 85% on < 200 trades | −15 (fake-buyer trap — kept from V2) |
+| avg trade size ≥ 3× baseline on thin count | −10 (whale prints, not a crowd) |
+| funding > +0.05%/8h (long) / < −0.05% (short) | −10 (crowded side, squeeze-prone) |
+| OI falling while price rises (long) | −5 (short squeeze, exhausts fast) |
+| L/S account ratio extreme for the side | −5 (retail crowding) |
+| OI ≥ +0.3% and price up (long) | **+5** (new money, real move) |
 
-### Filter 3 — Sell wall (order-book physics)
-
-Within +2% above price, the largest ask wall is found:
-
-| Condition | Effect |
-|---|---|
-| No wall within +2% (clear runway) | **+15** |
-| Price is **above** the wall (broken out) | **+15** |
-| Wall value > 5m USD volume (tape cannot eat it) | **−20** + warning *"Wall too big — cannot break"* |
-| Wall present but eatable | 0 (neutral) |
-| Book not fetched | 0, marked *"no data"* — never guessed |
-
-Plus the **break confirmation**: a wall only counts as broken after price holds
-above it ≥ 2 minutes. Short side mirrors this: an unbreakable ask wall *overhead*
-is a **ceiling that helps the short** (+15); a big bid wall *below* is squeeze
-risk (−15).
-
-### Filter 4 — Liquidity (trade count)
-
-| Condition | Effect |
-|---|---|
-| < 200 trades in 5m | **−20** |
-| > 500 trades in 5m | **+5** |
-
-### Filter 5 — Buyer trap / fake buyers
-
-| Condition | Meaning |
-|---|---|
-| buyPct > 85% **and** trades5m < 200 | *"Fake buyers"* — whale painting the tape (warning + never a GO) |
-| buyPct < 40% **and** vol5mUsd > $100k | *"Sellers dumping — exit / avoid"* |
-
-### Filter 6 — BTC market regime (the macro gate)
-
-BTC's own 15m move classifies the market:
-
-| BTC 15m | Mode | Effect on LONGS | Effect on SHORTS |
-|---|---|---|---|
-| > +0.30% | **Bull** | normal 70 bar | blocked |
-| −0.30% … +0.30% | **Flat** | stricter 80 bar | 80 bar |
-| < −0.30% | **Dump** | **all longs blocked** | bar lowered to 65, favoured |
-
-Also multi-timeframe: **BTC 1h falling (< −0.1%)** while 15m is green =
-bull-trap risk → long demoted to watch. Mirror for shorts (BTC 1h rising).
-
-### Filter 7 — Stablecoin immunity (veto)
-
-Two layers:
-1. The name blacklists from universe selection (§2.1).
-2. **Runtime detection** — regardless of name:
-   `price ∈ ($0.99, $1.01)` **and** `|change15m| ≤ 0.05%` **and** `|change24h| ≤ 1%`
-   → stablecoin → verdict `stable`, score irrelevant, never tradeable.
-
----
-
-## 6. Final Score & verdict thresholds
-
-```
-Final Score (long)  = Base Score
-                     + momentum pts        (filter 1)
-                     + dollar-volume pts   (filter 2)
-                     + wall pts            (filter 3)
-                     + liquidity pts       (filter 4)
-
-Final Score (short) = Base Score
-                     + mirrored momentum pts
-                     + dollar-volume pts
-                     + ceiling/bid-wall pts
-                     + liquidity pts
-                     + seller-pressure pts  (buyPct < 40% w/ real volume: +10;
-                                             buyPct > 60%: −15)
-```
-
-| Final Score | Verdict |
-|---|---|
-| ≥ 70 (bull mode) / ≥ 80 (flat mode) | **GO** — but must still pass the hard gates (§7) |
-| 60–69 | **Watch only** |
-| < 60 | **Skip** |
-| BTC dumping | longs → `blocked_btc` regardless of score |
-| stablecoin | `stable` regardless of score |
-
-Row verdict priority: `stable` → `go_long` → `go_short` → `blocked_btc` →
-`watch` → `skip`.
+The OI/funding/L-S weights are **provisional (ASSUMED)** — see §17's
+tuned/untuned split; they are displayed and logged so their contribution
+distributions can be measured before they're trusted.
 
 ---
 
 ## 7. Hard gates — what a GO must survive
 
-A GO is **not** just a number. After the score clears the bar, *every* one of
-these must also pass, or the verdict is demoted to `watch` with the reason shown:
+A GO is **not** just a number. After the composite clears the bar, every gate
+must pass or the verdict is demoted to `watch` with the vetoing gate recorded
+(`longDemoteGate` — which feeds the shadow log, §14.4):
 
 | Gate | Long requirement | Short requirement |
 |---|---|---|
-| Tape color | 5m and 15m both green | both red |
-| BTC 1h alignment | BTC 1h > −0.1% (no bull trap) | BTC 1h < +0.1% (dip gets bought) |
-| Day extension | 24h change ∈ [−5%, +8%] — never chase a move that already happened, never catch a falling knife | 24h ∈ [−15%, +5%] — crash mostly done = bounce risk; green day fights the short |
+| Listing age | ≥ 3 days since first candle | same |
+| Baseline trust | ≥ 20 usable baseline blocks | same |
+| Momentum (ATR-normalized) | residual 5m & 15m > their ATR bars | mirrored |
+| Day extension (**ATR-normalized**) | `change24h ∈ [−band, +min(8, band)]`, `band = clamp(3 × atrDaily, 3, 15)` | widened band + hard bounds |
 | Real money | vol5mUsd > $50k | same |
 | Participation | trades5m ≥ 200 | same |
-| Volume expansion | rvol ≥ 2× | same |
+| Volume expansion | rvol ≥ 2× (vs the §5 baseline) | same |
 | Crowd side | buyPct ≥ 52% | buyPct ≤ 48% |
-| Profit runway | TP zone not blocked by a wall (§8) | same vs bid wall |
-| Position vs wall | not sitting below an unbreakable ask wall | — |
+| BTC 15m regime | not dump (in BTC-ATR units, §7.1) | not bull |
+| BTC 1h alignment | BTC 1h > −0.1% (bull-trap filter) | BTC 1h < +0.1% |
+| Spread | ≤ 15 bps when known | same |
+| Profit runway | plan not wall-blocked; ≥ 1 block of depth to TP2 | mirrored |
+| Position vs wall | not below an unbreakable aged wall | not above an unbreakable bid floor |
 
-Every demotion carries a human-readable warning ("Day already +9.2% — the move
-happened without you", "Fake buyers — 91% buys on only 143 trades", …) —
-surfaced in the UI so the trader sees *why* a signal was refused.
+### 7.1 The BTC regime in ATR units **[AUDIT §3.3]**
 
----
+`btcMode = bull | flat | dump` from BTC's 15m move **divided by BTC's own
+15m ATR**: bull when `change15m > max(0.3%, 0.5 × btcAtr15m)`, dump when
+below the negation. A 2%-ATR BTC needs a real move to count as bullish; a
+0.1%-ATR BTC flips on ticks but the absolute floor keeps legacy behavior as
+the fallback. The regime bar is computed from BTC klines every scan and fed
+to the engine alongside the change.
 
-## 8. Trade plans — entry / stop / TP ranges (long & short)
+### 7.2 Ledger reset on regime flip **[AUDIT §10]**
 
-This is the "what range do I trade" machinery, sized per-coin from its own
-volatility and history.
-
-### 8.1 Stop distance — ATR-scaled risk
-
-```
-atrPct     = 14-period ATR of 1m candles, % of price        (per coin!)
-riskPct    = clamp(atrPct, min 1.0%, max 1.6%)
-```
-
-Rationale: a 0.5% stop on an alt with 0.4% five-minute noise is a coin flip.
-Tight stops look precise and get eaten. 1.0–1.6% is the honest band.
-
-### 8.2 Take profits — asymmetric by construction
-
-```
-TP1 = entry ± riskPct × 2.0     (risk:reward 1:2)
-TP2 = entry ± riskPct × 3.5     (risk:reward 1:3.5)
-```
-
-For a typical coin (riskPct 1.0%): long entry $0.1522 → stop $0.1507,
-TP1 $0.1552 (+2%), TP2 $0.1575 (+3.5%). Shorts mirror the geometry downward.
-
-### 8.3 Dollar risk framing
-
-The plan renders "you risk $5 → lose at most $0.05 if wrong; TP1 pays $0.10;
-TP2 pays $0.175" from the bot's investment amount — so position size is a
-*decision*, not an accident.
-
-### 8.4 Wall invalidation of the profit zone
-
-If a wall bigger than the 5m volume sits **between entry and TP2**, the plan is
-`blocked`: *"Wall $44.2K at $0.1537 sits inside the profit zone — the tape
-cannot eat it yet."* A blocked plan **demotes a GO to watch** — you do not aim
-a take-profit through a wall the tape cannot eat.
+A bearish block earned during a dump regime used to persist into the bull
+flip that followed. V2.1 clears directional blocks (keeping repeat dampers)
+whenever the regime mode changes between scans.
 
 ---
 
-## 9. Scenario analysis — before the decision
+## 8. Verdict thresholds, the uncapped score & the expectancy gate
 
-Every assessed row carries three scenarios, generated *before* the verdict is
-acted on, so the trader knows what confirms and what invalidates:
+```
+composite = Axis A + Axis B + Axis C + penalties     (0–100 nominal)
+```
 
-| Scenario | Built from |
-|---|---|
-| **Bull case — "Confirms → ride to TP"** | up to 3 live signals: volume holding ≥2× average · takers ≥55% buying · BTC supportive · broken wall holding as support · thin asks overhead → then the actual TP1/TP2 distances for this coin |
-| **Base case — chop** | volume normalises, price chops ±(coin's own ATR%) for an hour — *"waiting is the position"* |
-| **Bear case — "Invalidated → stop"** | sellers ≥55% of tape · volume fading <1.2× · the wall refusing to break · BTC rolling over · thin trade count → the actual stop distance, and the short-side score if the tape stays red |
+**[AUDIT §2.5] The composite is UNCAPPED internally.** The old score capped
+at 100, so a 113 and a 145 were indistinguishable — no ranking, no
+calibration, no prioritization under the 6-signals-per-scan cap. V2.1:
+
+- **Ranking:** GO candidates fire in uncapped-score order before the
+  per-scan cap — `go_long`/`go_short` priority is no longer arbitrary.
+- **Display:** the UI shows `min(100, score)` with a `100+` marker; the true
+  value rides in the tooltip.
+- **Calibration:** the backtest bins trades by uncapped score (§11.2), so
+  the number on the pill maps to an empirical hit rate.
+
+| Composite | Verdict (bull mode) | Flat mode | Dump mode (shorts) |
+|---|---|---|---|
+| ≥ goScore (60) | **GO** — gates still apply (§7) + the expectancy gate (§8.3) | ≥ goScoreFlat (67) | ≥ goScoreShortDump (55) |
+| ≥ watchScore (47) | **Watch** | same | same |
+| below | **Skip** | same | same |
+| BTC dumping / bull | longs `blocked_btc` / shorts `blocked_btc` | | |
+| stablecoin | `stable` (runtime veto, kept) | | |
+
+Row verdict priority: `stable` → `go_long` → `go_short` → `blocked_btc` →
+`watch` → `skip`.
+
+### 8.2 The measured truth (the shipped default calibration)
+
+Before shipping these constants, the engine was replayed over **90 days of
+5m bars on 8 mid-cap pairs** (volume ranks 50–130 — the anomaly universe's
+home turf), net of the 0.25% round-trip cost, pessimistic same-bar ordering,
+partial exits at TP1 with breakeven runners. Hit rate by uncapped score band:
+
+| Score band | n | P(TP1 before stop) | net expectancy/trade |
+|---|---|---|---|
+| 30–40 | 18 | 20% | −0.37% |
+| 40–50 | 138 | 24% | −0.34% |
+| 50–60 | 302 | 26% | −0.28% |
+| 60–70 | 603 | 26% | −0.30% |
+| 70–80 | 456 | 25% | −0.28% |
+| 80+ | 79 | **38%** | **−0.06%** (≈ breakeven) |
+
+Two honest readings:
+
+1. **The score ranks** — hit rate rises from 20% to 38% across bands (and
+   the top band is at breakeven), so the composite measures *something real*.
+2. **No band pays for itself in this window** — the 2R-target structure needs
+   ~42%+ after costs (§8.3 math), and 38% is the best the last 90 days offer.
+   On the top-10 majors the picture is worse (21–24% flat across bands) —
+   precisely the audit's §2.2 point that majors are the wrong universe.
+
+The original V2's 55–65% claims were artifacts: gross-of-fees grading,
+full-exit-at-TP1 grading, the broken 15m momentum measurement (a single
+stale bar — fixed in §14), 30-day windows, and survivorship-biased coin
+selection. This table is the number the app now shows you.
+
+### 8.3 The expectancy gate — a GO must pay for itself
+
+A GO requires **one more hard gate**, evaluated from the calibration:
+
+```
+c        = cost% / stopPct                       // cost in R units
+hitR     = 0.5×2R + 0.5×(0.5×3.5R + 0.5×0R)      // partial TP1 + 50/50 runner
+                                                   //   → 1.875R gross per hit
+lossR    = 1R
+estExpR  = p×(hitR − c) − (1−p)×(lossR + c)
+GO       ⟺ estExpR ≥ minExpectancyR (0.10R)
+```
+
+`p` comes from the score band's calibrated hit rate — **your own backtest's
+bins when they exist, the shipped 90-day measurement (§8.2) otherwise.** With
+the shipped default (p ≤ 0.38), estExpR stays negative at every stop
+distance, so live GOs are currently rare-to-none and candidates show
+"watch" with the honest note: *"Calibrated hit rate 26% (n=480) → est.
+−0.47R per trade — below the +0.10R GO floor; a backtest on a kinder window
+re-opens this."* Every expectancy veto lands in the shadow log like any
+other gate, so the cost of honesty is itself measurable. The **backtest
+replay runs with this gate OFF** — the replay is the calibration instrument
+and must see the raw signal, or it could never recalibrate the live one.
 
 ---
 
-## 10. Signal system & anti-flip-flop cooldowns
+## 9. Trade plans — constant-R geometry, constant dollar risk
 
-### 10.1 Signal types
+**[AUDIT §2.4 — the most important trade-plan change]** The old clamp
+`riskPct = clamp(atr, 1.0, 1.6)` inverted the risk geometry: a quiet 0.4%-ATR
+coin got a 1.0% stop and a TP1 5 ATR away (almost never reachable in 2h),
+while a violent 3%-ATR coin got a 1.6% stop *inside its own noise*
+(guaranteed stop-out). The clamp broke the one property that made the 2R/3.5R
+structure work.
 
-| Type | Direction | Detection rule |
+### 9.1 Stop distance — tracks the coin's own noise
+
+```
+stopPct = clamp(1.3 × atr1m, 0.8%, 2.5%)
+```
+
+- **1.3 × ATR** — the stop sits outside one noise band (industry-standard
+  structure distance).
+- **Floor 0.8%** — below this, fees + noise eat the edge. Measured on the
+  90-day replay: the 0.6% floor lost −0.40R/trade; 0.8% lost −0.26R — the
+  cost-to-R ratio (`c = 0.25/stop`) is why tight stops are so hard to pay
+  for, exactly as the audit's fee math predicted.
+- **Cap 2.5%** — beyond this the trade is unmanageable for this timeframe.
+
+### 9.2 Take profits — now constant in ATR units
+
+```
+TP1 = entry ± stopPct × 2.0      → always ≈ 2.6 ATR away
+TP2 = entry ± stopPct × 3.5      → always ≈ 4.5 ATR away
+```
+
+Because the stop tracks ATR and the TPs track the stop, the profit targets
+sit at a *constant ATR distance* on every coin — quiet or violent. The
+2R/3.5R reward structure is invariant by construction.
+
+### 9.3 Management rules (displayed on every plan)
+
+```
+50% off at TP1 · stop → breakeven at +1R · runner to TP2 · flat by 2h
+```
+
+### 9.4 Constant dollar risk **[AUDIT §2.4/§5]**
+
+```
+positionSize = (equity × 0.5%) / stopPct
+```
+
+A 0.8%-stop coin gets a 2× bigger position than a 1.6%-stop coin so the
+dollar loss when wrong is identical on every coin. The plan card shows this
+next to the user's investment amount ("size $625 (0.5% risk)" for $1000
+equity on a 0.8% stop).
+
+### 9.5 Instrument realism **[AUDIT §5.5]**
+
+Short plans are labeled **futures/margin instruments** — you cannot short on
+Binance spot. The plan notes that funding (~0.01%/8h typical) applies on
+holds; against a ≤2.5% stop and a 2h time stop, funding is noise but it is no
+longer invisible.
+
+### 9.6 Wall/runway invalidation (kept, upgraded)
+
+A wall bigger than the one-sided taker flow sitting between entry and TP2
+blocks the plan ("the tape cannot eat it yet"). New in V2.1: the plan is
+*also* blocked when cumulative ask depth all the way to TP2 is thinner than
+one 5m block of flow — "the exit does not exist". A blocked plan demotes a GO
+to watch.
+
+---
+
+## 10. New signals — OI, funding, L/S ratio, CVD, trade-size skew, wall age
+
+**[AUDIT §4 — "signals you're not using that actually predict"]** All free,
+all from Binance public endpoints, all wired into the engine as score
+components, checklist notes, and warnings (weights provisional — §17):
+
+| Signal | Source | Interpretation wired in |
 |---|---|---|
-| `pump_start` | long | score ≥ 80, 5m green, day ≤ +8% |
-| `volume_lead` | long | rvol ≥ 3 with price flat (±1% 1m & 5m) and flat day — money arrived *before* the move |
-| `buyer_pressure` | long | flat coin, rvol ≥ 2, takers ≥ 70% buys |
-| `seller_pressure` | short | flat coin, rvol ≥ 2, takers ≤ 30% buys |
-| `dump_start` | short | ≥3% below session high, rvol ≥ 2, falling 5m |
-| `spike_collapse` | short | rvol fell from ≥3× to <1.5× — the crowd is leaving |
-| `go_long` | long | **V2 verdict `go_long` + cooldown ledger agrees** |
-| `go_short` | short | **V2 verdict `go_short` + ledger agrees** |
+| **Open interest Δ15m** | `/futures/data/openInterestHist` | OI ↑ + price ↑ = new money (real) +5; OI ↓ + price ↑ = short squeeze (exhausts fast) −5 |
+| **Funding rate** | `/fapi/v1/premiumIndex` | extreme positive = crowded longs → long penalty −10; extreme negative = crowded shorts → short penalty |
+| **Long/short account ratio** | `/futures/data/globalLongShortAccountRatio` | retail crowding — fade extremes −5 |
+| **CVD slope & divergence** | derived from the existing aggTrade stream / kline `takerBuyQuote` | price↑ + CVD↓ = absorption → momentum check fails, scenario warns |
+| **Trade-size skew** | avg trade size vs baseline | ≥3× size on thin count = whale prints −10 (direct detection of what the fake-buyer trap caught only indirectly) |
+| **Wall age/persistence** | tracked across depth snapshots | <60 s = probably spoofed, half penalty; aged = real, full penalty |
+| **Spread** | top of the depth snapshot | >15 bps = honest veto on exits |
+| **Depth at TP** | cumulative asks to +7% | exit-liquidity veto (§9.6) |
+| **Listing age** | first-ever 1d candle (`startTime=0`) | <3 days = baselines meaningless, GO refused |
 
-Max 6 signals fire per scan. V1-style signals (pump_start etc.) carry a 10-minute
-per-pair cooldown; GO signals carry 30 minutes.
+CVD and trade-size skew come from data the app already had — the audit's
+point was that the *derivation* was missing, not the data.
 
-### 10.2 The CooldownLedger — killing the flip-flop
+---
 
-V1's trust killer: an 18:08 "exit" followed by an 18:15 "go long" on the same
-coin. V2's ledger enforces:
+## 11. Scenario analysis & backtest calibration
+
+### 11.1 Scenarios (before the decision — kept)
+
+Every assessed row carries three scenarios (bull/base/bear) built from live
+signals: volume holding, taker flow, BTC regime, broken-wall support, CVD
+divergence, funding crowding — each with the coin's actual TP/stop distances.
+The bear case names what flips it; the base case names the ATR band it chops
+in and the time stop.
+
+### 11.2 Backtest-calibrated hit rates **[AUDIT §9 — "attach base rates"]**
+
+When you run a backtest, the results are binned by uncapped score
+(`buildCalibration`) and persisted (`sift:calibration:v1`). The live radar
+then labels candidates with the *empirical* hit rate of their score band —
+"est. 54% TP1-first (n=120, your 30d backtest)" — instead of implying the
+score itself is a probability. Bands with n < 30 stay silent. This is a
+bin-level (isotonic-style) calibration using your own data; the audit's full
+logistic model needs ~1,000 trades before it's honest, and this is the
+scaffolding that will carry it.
+
+---
+
+## 12. Signal system, anti-flip-flop cooldowns & the portfolio layer
+
+### 12.1 Signal types (unchanged from V2)
+
+`pump_start`, `volume_lead`, `buyer_pressure`, `seller_pressure`,
+`dump_start`, `spike_collapse` (V1-style, 10-min cooldowns) and the gated
+`go_long` / `go_short` (V2 verdict + ledger + portfolio guard). Max 6 per
+scan, **GO candidates first in uncapped-score order [AUDIT §2.5/§10]**.
+
+### 12.2 The CooldownLedger (kept — the audit liked it)
 
 | Event | Consequence |
 |---|---|
-| Bearish signal (seller_pressure / dump_start / spike_collapse) | longs blocked for that pair **60 min** |
-| `go_short` fires | longs blocked **30 min** |
-| `go_long` fires | shorts blocked **30 min** |
-| same-side GO | cannot re-fire for **30 min** (repeat damping) |
+| Bearish signal fires | longs blocked for that pair 60 min |
+| `go_short` fires | longs blocked 30 min |
+| `go_long` fires | shorts blocked 30 min |
+| same-side GO | cannot re-fire 30 min (repeat damping) |
 
-The ledger is shared by the live scanner, the browser engine, and the backtest.
+Shared by live scanner, browser engine and backtest. **New:** regime flips
+clear directional blocks (§7.2).
 
----
+### 12.3 The portfolio layer **[AUDIT §5.2 — new]**
 
-## 11. Outcome grading — accountability loop
+Per-signal verdicts with no portfolio view meant a BTC-led pump sent 40
+simultaneous GOs — one trade wearing 40 tickers. The `PortfolioGuard`
+(shared engine class) enforces, live in both tiers:
 
-Every fired signal is tracked to maturity and persisted (SQLite `Signal` model,
-ingest webhook from scanner → Next.js API):
+- **Max 3 concurrent GO signals** (45-minute active window each).
+- **Correlation gate:** Pearson ρ of the last 60 1m returns vs every open
+  signal's pair; ρ > 0.7 → "same trade wearing a different ticker", refused.
+- **Kill switch:** 5 consecutive losing finals, or −6R on the day (≈ −3%
+  equity at 0.5% risk), pauses *new* entries until the UTC day rolls — open
+  positions keep managing.
 
-- **5 min later** — price & change recorded.
-- **15 min later** — recorded.
-- **60 min later** — recorded, status `final`.
-- **Continuously** — direction-adjusted **MFE** (max favorable excursion) and
-  **MAE** (max adverse excursion) since the signal fired.
-
-Go signals additionally store the trade plan they fired with (stop, TP1, TP2,
-atrPct) so the log can be graded against the plan, not just raw price. The log
-prunes itself after 7 days. This is what makes "the app says it worked" a
-checkable claim instead of vibes.
-
----
-
-## 12. Backtest — proving the filters
-
-The Backtest view replays **30 days of 5m candles for 20 coins** through the
-exact same `assessLong`/`assessShort` functions:
-
-### 12.1 Replay construction (no look-ahead)
-
-For each bar `i`:
-- **"Now" = the last closed bar** (`i−1`). Momentum: 5m = 1 bar, 15m = 3 bars.
-- **Baseline** = mean volume of the 12 bars *before* the signal bar (one hour,
-  excluding the spike itself — including it would dampen the expansion being measured).
-- `rvol`, `tradeSpike`, `buyPct` (from `takerBuyQuote`), close strength, rolling
-  ATR (5m ATR ÷ 2.2 ≈ 1m ATR, √time scaling), rolling 24h change (288 bars).
-- BTC regime comes from a parallel BTC candle series aligned by 5m bucket.
-- **Wall filter honestly off** — free historical order books don't exist; the
-  UI says so instead of pretending.
-- The CooldownLedger runs during replay exactly as live.
-
-### 12.2 Trade grading (conservative)
-
-Each go-signal is graded over the next **24 bars (2 hours)**:
-- Same-bar stop + target → **stop wins** (pessimistic ordering).
-- Stop hit → `loss` (−riskPct). TP2 hit → `big_win` (+tp2Pct).
-  TP1 hit → `win` (+tp1Pct). Neither in 2h → `timeout` (mark-to-market).
-
-### 12.3 Statistics
-
-`winRate = (wins + bigWins) / decided`, plus avg win/loss %, **profit factor**
-(gross win / gross loss), and **expectancy** (mean pnl per trade). Decision
-rule: win rate < 55% → tighten thresholds (the tune script grid-searches);
-> 65% and healthy trade count → ship.
+Portfolio-blocked GOs land in the shadow log (gate `portfolio` /
+`kill-switch`) rather than vanishing, so the cost of the guard is itself
+measurable.
 
 ---
 
-## 13. Bots & FreeCryptoAPI integration
+## 13. Outcome grading — accountability loop (kept)
 
-A **bot** = the user's money with an opinion: investment amount + entry +
-direction + **target range** [low, high] + optional **stop range** + expiry.
-Bots live in the browser's localStorage (no accounts, no fake cloud sync).
-
-### 13.1 The dual-path price engine
-
-While any bot is armed (`watching` / `in_target`):
-
-1. **REST poll loop** → `POST /api/bot/poll` (server proxy — the FreeCryptoAPI
-   key never reaches the browser):
-   - FreeCryptoAPI `/v1/getData` is the **primary** feed — used *only* while
-     bots exist, per the credits decision (1 credit per returned symbol).
-   - Cadence: **8 s** while the tab is visible, **45 s** while hidden.
-2. **Live tape ingestion** — tick-level prices from the radar (websocket tier).
-   The instant a boundary is crossed, a **targeted confirm poll** (just that
-   symbol, debounced 1.5 s) verifies the hit on the REST feed before notifying —
-   no alerts off a single flickering tick.
-
-FreeCryptoAPI outage or quota wall → automatic failover to Binance public
-ticker: a range hit is still caught. Both feeds dead → retry is automatic, the
-bot UI shows the notice.
-
-### 13.2 State machine
-
-```
-watching ──price enters [targetLow, targetHigh]──▶ in_target     (notify once)
-in_target ──price exits range +0.5% buffer───────▶ watching      (re-arm, log)
-watching/in_target ──price enters stop range─────▶ stopped       (notify, terminal)
-any active ──expiry passed───────────────────────▶ expired       (log)
-```
-
-Every alert: sound + toast + native browser notification (when hidden) +
-event log on the bot. P&L is computed live from entry vs direction.
+Every fired signal is tracked to maturity: price/change at 5/15/60 min,
+running direction-adjusted MFE/MAE, persisted (SQLite via ingest webhook
+server-side; localStorage browser-side). GO signals store their plan
+(stop/TP1/TP2/ATR/riskPct) so the log grades against the plan. The browser
+engine's kill switch is fed from these finals (§12.3). The log prunes at 7
+days. Known honesty gap (kept from V2, now stated): MFE/MAE use last-price,
+not fill-price, and do not subtract fees.
 
 ---
 
-## 14. Reliability engineering
+## 14. Backtest — the honest edition
+
+**[AUDIT §6 — "the weakest link"]** The V2 backtest was honest about order
+books but dishonest by omission about nearly everything else. V2.1:
+
+### 14.1 Point-in-time universe
+
+Coins are chosen by **24h volume as of the window's start**, not today —
+each candidate's volume at `windowStart` is read from one `1d` kline
+(`endTime=windowStart`). The candidate pool is still today's top-120 (free
+APIs don't serve point-in-time *lists*), which is stated in the UI: the
+selection *within* the pool is point-in-time, the pool itself carries
+survivorship. This kills most of the "replaying the coins that already
+pumped" bias at zero cost.
+
+### 14.2 Costs on every trade
+
+`cost = 0.25%` per round trip (2 × 0.1% taker + estimated alt slippage),
+subtracted from every graded trade. The stats default to **net**; a toggle
+shows gross. At a 1.2% stop this is ~21% of the risk unit — the margin the
+old backtest silently overstated.
+
+### 14.3 Partial-exit grading (matches §9.3)
+
+- Stop before TP1 → `loss` (−1R − cost).
+- TP1 then return to entry → `be` ("TP1→BE": +0.5×TP1 − cost).
+- TP1 then TP2 → `big_win` (+0.5×TP1 + 0.5×TP2 − cost).
+- Neither level in 24 bars (2h time stop) → `timeout`, mark-to-market.
+- Same-bar stop + target → **stop wins** (kept — the audit's first "genuinely
+  strong" item).
+
+`winRate` now means **P(TP1 touched before the stop)** — the calibration
+target the hit-rate labels quote.
+
+### 14.4 The shadow log **[AUDIT §6 — "the single cheapest accuracy tool"]**
+
+Every would-be GO that a gate (or the cooldown ledger, or the portfolio
+guard) vetoed is graded as if it had fired, tagged with the **first blocking
+gate**. The Gate-efficacy table then answers the question the old system
+could never answer: *is this gate blocking winners or losers?* A gate whose
+rejections would have hit 58% is costing money; one whose rejections hit 32%
+is doing its job. The browser engine keeps the same log **live** (vetoes
+graded at 60 min, 30-min dedupe), shown beside the backtest table.
+
+### 14.5 Statistics & sample honesty **[AUDIT §3.5]**
+
+Win rate with a **Wilson 95% CI**, expectancy in **R units**, profit factor,
+and the verdict text keyed to *expectancy × trades*, not win rate
+(≥0.30R with ≥100 decided = "edge worth trusting"; <100 decided gets an
+explicit "sample too small — you are fitting noise" note; the audit's math:
+~150 trades put a ±8% CI around a 60% rate). The intro copy states the
+target explicitly: fewer than ~1,000 backtested trades and no threshold
+decision is meaningful.
+
+### 14.6 Walk-forward sanity
+
+Results split at the median time into first/second halves; if the halves'
+win rates differ by >15 points, the UI warns about in-sample drift. The tune
+script's grid searches over one window and the shipped constants are its
+best-**CI** pick, not its point-estimate peak.
+
+### 14.7 Still honestly missing
+
+Historical order books (wall filter off in replay — live is strictly
+stricter, and the wall block remains flagged UNTUNED), historical OI/funding
+(null in replay), and the 5m→1m ATR conversion uses the measured √5 scaling
+(the old ÷2.2 was numerically the same but undocumented).
+
+---
+
+## 15. Bots & FreeCryptoAPI integration (unchanged)
+
+A **bot** = investment amount + entry + direction + **target range** [low,
+high] + optional **stop range** + expiry, in browser localStorage. While any
+bot is armed: REST poll loop → `POST /api/bot/poll` (server proxy; the
+FreeCryptoAPI key never reaches the browser) at 8 s visible / 45 s hidden,
+with live-tape ingestion from the radar and a targeted 1.5 s-debounced
+confirm poll before any notification. State machine:
+`watching → in_target → (re-arm | stopped | expired)`, with sound + toast +
+native notification. FreeCryptoAPI outage → Binance public ticker failover.
+
+---
+
+## 16. Reliability engineering (kept, plus the restart-proof fixes)
 
 | Problem | Solution |
 |---|---|
-| Binance IP bans on shared egress | adaptive weight-tier pacing, 418/429 doubling backoff, 3-host failover |
-| Old app reset dump detector on reload | session state (highs, spikes) lives in the scanner service, not the page |
-| Signal log only existed while a tab was open | server scanner runs 24/7; log persisted in SQLite via ingest webhook (browser engine keeps a localStorage log, mirrored best-effort) |
-| Free API caches (1–5 min stale) | scanner polls raw klines/depth directly; browser engine uses websockets (tick-level) |
-| Websocket blocked by a gateway | automatic tier downgrade: socket → REST poll → in-browser engine |
-| One user's API spend multiplied by N visitors | one scanner feeds everyone over socket.io |
+| Binance IP bans on shared egress | adaptive weight pacing, doubling backoff, 3-host failover |
+| State lost on restart **[AUDIT §2.6]** | session high from 24h data; volume history persisted to disk/localStorage; listing ages persisted |
+| Scan staleness at high volume **[AUDIT §5.4]** | hot/cold priority rotation in the kline pump |
+| One user's spend × N visitors | one scanner feeds everyone over socket.io |
+| Websocket blocked | automatic tier downgrade: socket → REST → in-browser engine |
+| Missing data | displayed as **"No Data"** — never a fake pass |
+| Correlated simultaneous GOs **[AUDIT §5.2]** | portfolio guard: concurrency cap, ρ-gate, kill switch |
 | Netlify build minutes | build happens locally, only artifacts upload |
-| Missing data | displayed as **"No Data"** — never guessed, never defaulted to a fake pass |
 
-Other free data sources layered in: CoinPaprika (board, coin detail, global
-stats — client-side per-user IP), DeFiLlama (price history fallback),
-alternative.me (Fear & Greed strip). All behind the same TTL-cache +
-inflight-dedup + stale-serve pattern.
+Free sources layered: CoinPaprika (board/detail/global), DeFiLlama (history
+fallback), alternative.me (Fear & Greed), Binance spot + futures public
+endpoints — all behind TTL-cache + inflight-dedup + stale-serve.
 
 ---
 
-## 15. Complete tunables table
+## 17. Complete tunables table (tuned vs assumed)
 
-Every threshold in one place (`V2` const in `v2-engine.ts`) — this is the
-surface the backtest tunes:
+**[AUDIT §15 — "half the tunables had no derivation"]** Every constant in
+`V2` (v2-engine.ts), sorted by evidence. **TUNED** = derived from replaying
+real history (`scripts/tune-v2.ts`, 14d × 16 coins, ranked by net
+expectancy-R × trades with Wilson-CI finalists). **ASSUMED** = documented
+rationale, no validated derivation — these are the high-risk knobs; the
+shadow log (§14.4) is the instrument that will retire them.
 
-| Constant | Value | Meaning |
-|---|---|---|
-| `momentumGreen` | 0.4 | % move required on 5m **and** 15m (+15 pts) |
-| `momentum1mRed` | −0.1 | 1m below → extra −10 |
-| `volHighUsd` | 100,000 | 5m USD volume above → +10 |
-| `volLowUsd` | 50,000 | below → −20 |
-| `tradesLow` | 200 | fewer 5m trades → −20 |
-| `tradesHealthy` | 500 | more → +5 |
-| `wallVsVol` | 1 | wall > 1× 5m volume = unbreakable |
-| `wallScanPct` | 2 | walls counted within ±2% of price |
-| `wallConfirmMs` | 120,000 | break must hold 2 min |
-| `btcBull` / `btcDump` | +0.3 / −0.3 | BTC 15m regime boundaries |
-| `goScore` | 70 | GO bar in bull mode |
-| `goScoreFlat` | 80 | GO bar in flat mode (shorts in dump: 65) |
-| `watchScore` | 60 | watch-only bar |
-| `goLongDayMin/Max` | −5 / +8 | 24h extension gate for longs |
-| `goShortDayMin/Max` | −15 / +5 | 24h extension gate for shorts |
-| `goMinRvol` | 2 | volume expansion required for GO |
-| `goMinBuyPctLong` | 52 | crowd must be buying for long GO |
-| `goMinBuyPctShort` | 48 | crowd must be selling for short GO |
-| `fakeBuyersPct/Trades` | 85 / 200 | fake-buyer trap thresholds |
-| `sellersDumpingPct/VolUsd` | 40 / 100,000 | seller-dump warning thresholds |
-| `tp1Mult` / `tp2Mult` | 2 / 3.5 | take-profit multiples of risk |
-| clamp of `riskPct` | 1.0–1.6 | stop distance band (% of price) |
-| `longBlockAfterBearishMs` | 60 min | no longs after a bearish signal |
-| `longBlockAfterShortMs` | 30 min | no longs after a go_short |
-| `shortBlockAfterLongMs` | 30 min | no shorts after a go_long |
-| `signalRepeatMs` | 30 min | same-side GO re-fire damping |
-| scan cadence | 5 s server / 1 s browser | compute-only |
-| universe | top 40 by 24h volume + BTC + ETH + subscribed | refreshed 5 min |
-| `MAX_FORWARD_BARS` | 24 | backtest trade window (2 h) |
-| bot poll cadence | 8 s visible / 45 s hidden | FreeCryptoAPI spend control |
+| Constant | Value | Class | Derivation |
+|---|---|---|---|
+| `goScore` | 60 | TUNED | 90-day measured calibration — top bands carry the only near-breakeven expectancy; the expectancy gate does the precision work |
+| `goScoreFlat` | 67 | TUNED | goScore + 7 (flat-regime strictness) |
+| `goScoreShortDump` | 55 | TUNED | dump-mode short bar, own calibration (audit §3.7: shorts are not mirrored longs) |
+| `watchScore` | 47 | TUNED | display boundary; does not gate trades |
+| `minExpectancyR` | 0.10 | TUNED structure / ASSUMED margin | the GO floor: estExpR from the calibrated hit rate must clear it (audit suggested 0.15; 0.10 lets genuinely good user calibrations through at moderate stops) |
+| `DEFAULT_CALIBRATION` | §8.2 table | MEASURED | 90d × 8 mid-caps, net of costs, pessimistic grading — replaced by the user's own backtest on first run |
+| `goMinRvol` | 2 | TUNED | volume-expansion gate |
+| `momentumAtrMult` | 0.5 | ASSUMED | ½-ATR impulse; structure TUNED (floor/grid) |
+| `momentumFloorPct` | 0.15 | TUNED | visible-tick floor for dead-quiet coins |
+| `btcAtrMult` | 0.5 | ASSUMED | regime in BTC-ATR units; absolute ±0.3% fallback is the legacy TUNED value |
+| `dayAtrMult` | 3 | ASSUMED | 3× daily ATR band, clamped to the old TUNED −5/+8/−15/+5 hard bounds |
+| `volHighUsd` / `volLowUsd` | $100k / $50k | TUNED | liquidity floors (absolute by design) |
+| `tradesLow` | 200 | TUNED | participation floor |
+| `stopAtrMult` | 1.3 | ASSUMED | industry-standard noise band |
+| `stopMinPct` / `stopMaxPct` | 0.8 / 2.5 | TUNED | fee/noise floor (measured: −0.26R vs −0.40R at 0.6%) / manageability cap |
+| `tp1Mult` / `tp2Mult` | 2 / 3.5 | TUNED | constant-R geometry |
+| `partialTp1Fraction` | 0.5 | ASSUMED | standard practice |
+| `beAtR` | 1 | ASSUMED | breakeven after +1R |
+| `timeStopMin` | 120 | TUNED | equals the backtest window |
+| `equityRiskFraction` | 0.005 | ASSUMED | 0.5% per trade |
+| `backtestCostPct` | 0.25 | ASSUMED | 2× taker fee + slippage estimate; charged in backtests AND in the live expectancy gate |
+| `wallVsTaker` | 1 | ASSUMED (wall block: **UNTUNED** — cannot backtest books) |
+| `wallFreshSec` | 60 | ASSUMED | spoof discount until persistence proven |
+| `wallScanPct` | 2 | ASSUMED | scan band |
+| `wallConfirmMs` | 120,000 | TUNED | 2-min hold kills wick fakes |
+| `spreadMaxBps` | 15 | ASSUMED | exit-cost veto |
+| `listingMinAgeDays` | 3 | ASSUMED | baseline-trust veto |
+| `historyMinBlocks` | 20 | ASSUMED | rvol-trust veto |
+| `fundingCrowdedPct` | ±0.05 | ASSUMED | provisional positioning weight |
+| `oiRealChange` | 0.3 | ASSUMED | provisional |
+| `fakeBuyersPct/Trades` | 85 / 200 | TUNED | kept from V2 |
+| `sellersDumpingPct/VolUsd` | 40 / 100k | TUNED | kept |
+| `goMinBuyPctLong/Short` | 52 / 48 | TUNED | crowd gate |
+| cooldowns (60/30/30/30 min) | — | TUNED | kept from V2 |
+| `maxConcurrentSignals` | 3 | ASSUMED | portfolio cap |
+| `correlationMax` | 0.7 | ASSUMED | ρ-gate |
+| `killSwitchLossStreak` / `killSwitchDayLossR` | 5 / −6R | ASSUMED | kill switch |
+| universe | top 60 by 7-day volume anomaly | TUNED structure | floors $2M vol / 5k trades |
+| scan cadence | 5 s server / 1 s browser | — | compute-only |
 
----
-
-## 16. Worked examples
-
-The three cases that motivated V2 (from the V1 signal log):
-
-**1. TRX — score 72, but the tape was against it.**
-5m −0.06% (red) → −20. Wall $172K vs $61K 5m volume, price below it → −20.
-`72 − 20 − 20 = 32` → **NO TRADE.** V1 said "buy". V2 refuses.
-
-**2. PEPE — score 61, momentum already rolling over.**
-5m −0.20% → −20. `61 − 20 = 41` → **NO TRADE.**
-
-**3. "U" — score 86, but it is a stablecoin.**
-Price $1.0004, 15m +0.01%. Runtime stablecoin detection → verdict `stable`,
-**veto**. V1's highest-scoring signal of the day, impossible to profit on.
-
-**4. A hypothetical GO.**
-Base 68 (rvol 3.2× = 16.5 pts, trade spike 2× = 2.5, momentum all-green +25,
-buyPct 63% = 8.7, close strength 0.7 = 10.5). Momentum +15 (5m +0.55%, 15m
-+0.62%), volume +10 ($240K in 5m), wall +15 (broke a $90K wall 3 min ago and
-held), liquidity +5 (810 trades). **Final 113 → capped 100+ → GO at 70 bar.**
-Hard gates: day +2.1% ✓, rvol 3.2 ✓, buyers 63% ✓, BTC bull +0.42% ✓, TP zone
-clear ✓ → `go_long` with entry $0.1522, stop −1.2% (ATR 1.2%), TP1 +2.4%,
-TP2 +4.2%.
+To re-tune: `bun scripts/tune-v2.ts [days] [coins]` — prints long/short/
+combined rankings by net expectancy-R × trades with CIs. Pick the config
+whose CI excludes zero.
 
 ---
 
-## 17. Known limitations (honest list)
+## 18. Worked examples
 
-1. **No filter set predicts the market.** The 65–70% target is a *tuning goal
-   verified by backtest*, not a promise; live results differ.
-2. **Backtest has no order-book history** — the wall filter is honestly disabled
-   in replay, so live performance ≠ backtest performance (live is stricter).
-3. **Same-bar stop+target resolution is pessimistic** (stop wins); real fills
-   could be better *or* worse (slippage, fees are not modeled).
-4. **Server-scanner tier availability**: on static hosting the browser engine
-   only scans while a tab is open; the 24/7 scanner requires self-hosting the
+**1. The old blacklist killing real tokens [AUDIT §2.1].** JUP (Jupiter,
+top-40 volume) ends in "UP" → V2 excluded it from the universe. BNB — the
+benchmark asset — ends in "B" → excluded. SHIB, ARB, CKB, DGB, TRB → all
+excluded. V2.1's exact-match blacklist admits all of them while still
+killing every actual stablecoin, pegged asset, fiat pair and leveraged token.
+
+**2. The old baseline inventing a spike [AUDIT §2.3].** A coin trading its
+normal 03:00 UTC volume (10–30% of its afternoon volume) read as a 3–4×
+"rvol spike" against a 15:00-anchored baseline → false GOs all night. V2.1
+compares 03:00 to 03:00: the same tape reads 1.1× and the engine stays quiet.
+
+**3. The old ATR clamp breaking a quiet coin [AUDIT §2.4].** Coin with
+0.4% 1m ATR: old stop 1.0% (2.5 ATR), TP1 2.0% = 5 ATR away — a 2-hour coin
+flip that almost never pays. V2.1: stop 0.8% (fee/noise floor — the 90-day
+measurement showed 0.6% losing an extra −0.14R to costs), TP1 1.6% ≈ 2.6 ATR —
+the same geometry as every other coin, and the position size scales to keep
+the dollar risk constant.
+
+**4. A hypothetical V2.1 GO — and why you currently won't get one.** An
+anomaly-ranked universe picks a rank-140 coin at 2.8× volume anomaly; rvol
+3.1 vs its own 21:00-UTC baseline; residual 5m +0.42% vs a 0.5×ATR bar of
+0.28% (β 1.1, BTC +0.15%); takers 61% buys; CVD +0.2; close strength 0.72
+range-weighted; no aged wall in band; spread 6 bps; funding +0.01%; OI
++0.6%. Participation 24/40 + Directional 26/35 + Micro 19/25 = **69 →
+crosses the 60 bar in bull mode**. Gates: listing 340d ✓, history 276
+blocks ✓, momentum ✓, day +3.1% inside the ATR band ✓, $180K/5m ✓, 640
+trades ✓, crowd ✓, BTC flat-not-dump ✓, spread ✓, runway ✓ — and then the
+**expectancy gate**: the 60–70 band's calibrated hit rate is 26%, est.
+−0.47R < +0.10R floor → **demoted to watch** with the note showing the
+numbers. If your own backtest window measures that band at 48%, estExpR
+= +0.28R → the same setup fires `go_long` with entry, stop −1.3×ATR
+(clamped 0.8–2.5%), TP1 +2×stop, TP2 +3.5×stop, half off at TP1, BE at
++1R, flat by 2h, size = equity×0.5%/stop.
+
+**5. The portfolio guard refusing a same-trade [AUDIT §5.2].** BTC leads a
+market-wide pump; 14 coins clear the GO bar within minutes. The guard fires
+the top-uncapped-score three, refuses the rest at ρ > 0.7 with each open
+position, and logs every refusal to the shadow log where their would-be
+outcomes are graded — the cost of the guard is visible, not assumed.
+
+---
+
+## 19. Known limitations (honest list)
+
+1. **No filter set predicts the market — and the app now says so.** The
+   measured 90-day calibration (§8.2) ships INSIDE the engine: hit rates of
+   20–38% by band, no band at positive net expectancy in that window. The
+   expectancy gate keeps live GOs off until a backtest on your window
+   shows a band that pays (≥ ~42–45% hit). Over-filtering toward a 65%
+   fantasy was the one guaranteed way to make this worse; the fix is the
+   opposite — measure, label, and refuse.
+2. **Sample size is the binding constraint.** Fewer than ~1,000 backtested
+   trades = fitting noise. The backtest UI says so instead of implying
+   confidence.
+3. **The wall block is UNTUNED.** Historical order books aren't free, so the
+   replay cannot validate `wallVsTaker`, `wallFreshSec`, or the wall weights.
+   Live is strictly stricter than backtest; the live shadow log is the only
+   instrument that can retire this.
+4. **OI/funding/L-S weights are provisional** (ASSUMED in §17) — displayed
+   and logged, not validated.
+5. **Point-in-time universe is a compromise**: selection within the pool is
+   historical; the pool itself is today's top-120 (stated in the UI).
+6. **Futures data is best-effort in the browser** (CORS on fapi can fail) —
+   nulls are honest, the engine runs without them.
+7. **MFE/MAE use last-price, not fill-price, and don't subtract fees.**
+8. **Server-scanner tier availability**: on static hosting the browser engine
+   scans only while a tab is open; the 24/7 scanner requires self-hosting the
    mini-service.
-5. **Binance-only microstructure**: walls, taker flow and trade counts come from
-   Binance; a coin pumping on another venue first will be late.
-6. **MFE/MAE grading uses last-price, not fill-price.**
-7. **FreeCryptoAPI credits** are spent only while bots are armed — poll cadence
-   is the cost control; heavy multi-bot usage still consumes quota.
-
----
-
-*Sift V2 — the scanner that refuses to speak unless the tape, the book, the
-crowd, the regime and the math all agree.*
+9. **Binance-only microstructure**: walls/taker flow/trade counts come from
+   Binance; a coin pumping on another venue first is late. (Multi-venue
+   confirmation via Coinbase/OKX/Bybit public tickers is the audit's next
+   cheap add.)
+10. **FreeCryptoAPI credits** are spent only while bots are armed; poll
+    cadence is the cost control.

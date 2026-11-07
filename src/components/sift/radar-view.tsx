@@ -252,7 +252,10 @@ export function RadarView({
                 className="flex w-full items-center justify-between gap-2 border-t border-border/60 px-3 py-2 text-left"
                 aria-expanded={expanded === r.pair}
               >
-                <VerdictChip verdict={r.v2.verdict} size="sm" />
+                <span className="flex items-center gap-1.5">
+                  <VerdictChip verdict={r.v2.verdict} size="sm" />
+                  {r.v2.hitRate != null && r.v2.hitRate.n > 0 && <CalChip p={r.v2.hitRate.p} n={r.v2.hitRate.n} />}
+                </span>
                 <span className="flex items-center gap-1 text-[11px] text-muted-foreground">
                   plan & scenarios
                   <ChevronDown className={cn("size-3.5 transition-transform", expanded === r.pair && "rotate-180")} aria-hidden="true" />
@@ -279,6 +282,21 @@ export function RadarView({
 
 function ScorePlaceholder() {
   return <span className="num inline-flex h-6 min-w-9 items-center justify-center rounded-md border border-border font-mono text-xs text-muted-foreground">—</span>;
+}
+
+/** Backtest-calibrated hit rate chip — rendered next to the verdict. */
+function CalChip({ p, n }: { p: number; n: number }) {
+  return (
+    <span
+      className={cn(
+        "num rounded-md border px-1 py-0.5 font-mono text-[10px] font-medium leading-none",
+        p >= 0.55 ? "border-up/40 text-up" : p >= 0.45 ? "border-warn/40 text-warn" : "border-down/40 text-down",
+      )}
+      title={`backtest-calibrated empirical hit rate, n=${n}`}
+    >
+      cal: {(p * 100).toFixed(0)}%
+    </span>
+  );
 }
 
 function RadarRowLine({
@@ -354,7 +372,12 @@ function RadarRowLine({
         <td className="px-3 py-2.5 text-center">
           {row.v2 ? <FinalScorePill score={row.v2.longScore} verdict={row.v2.verdict} /> : <ScorePlaceholder />}
         </td>
-        <td className="px-3 py-2.5">{row.v2 ? <VerdictChip verdict={row.v2.verdict} /> : <RadarBadgeChip badge={row.badge} />}</td>
+        <td className="px-3 py-2.5">
+          <span className="inline-flex items-center gap-1.5">
+            {row.v2 ? <VerdictChip verdict={row.v2.verdict} /> : <RadarBadgeChip badge={row.badge} />}
+            {row.v2 && row.v2.hitRate != null && row.v2.hitRate.n > 0 && <CalChip p={row.v2.hitRate.p} n={row.v2.hitRate.n} />}
+          </span>
+        </td>
         <td className="px-4 py-2.5 text-right"><Sparkline points={row.spark} className="ml-auto block" /></td>
       </tr>
       {expanded && row.v2 && (

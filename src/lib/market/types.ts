@@ -119,6 +119,10 @@ export type TradePlan = {
   atrPct: number | null;
   blocked: boolean;
   blockReason: string | null;
+  // V2.1 — trade management + instrument realism.
+  instrument?: "spot" | "futures";
+  timeStopMin?: number;
+  management?: string[];
 };
 
 export type Scenario = { tone: "bull" | "base" | "bear"; title: string; body: string };
@@ -127,7 +131,7 @@ export type RowVerdict = "go_long" | "go_short" | "watch" | "skip" | "blocked_bt
 export type SideVerdict = "go" | "watch" | "skip" | "blocked_btc";
 
 export type RadarRowV2 = {
-  longScore: number;
+  longScore: number; // UNCAPPED composite — UI displays min(score, 100) with a "+" marker
   shortScore: number;
   verdict: RowVerdict;
   longVerdict: SideVerdict;
@@ -143,6 +147,14 @@ export type RadarRowV2 = {
   trade: TradePlan | null;
   shortTrade: TradePlan | null;
   scenarios: Scenario[];
+  // V2.1 additions (optional — older snapshots keep loading).
+  axes?: { participation: number; directional: number; microstructure: number };
+  hitRate?: { p: number; n: number } | null;
+  wallAgeSec?: number | null;
+  spreadBps?: number | null;
+  futures?: { oiChange15m: number | null; fundingRatePct: number | null; lsRatio: number | null };
+  longDemoteGate?: string | null; // first gate vetoing a would-be long GO (shadow logging)
+  shortDemoteGate?: string | null;
 };
 
 export type RadarRow = {

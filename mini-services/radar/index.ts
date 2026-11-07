@@ -19,18 +19,46 @@
 //
 // Data: Binance public market-data domain, no key. Polling, not websockets —
 // 5-second granularity, honestly labeled as such.
+//
+// V2.1 audit pass (server side, feeding the rewritten v2-engine): exact-match
+// junk blacklist, a 60-pair universe ranked by 24h-volume anomaly against a
+// persisted 7-day history, a time-of-day/self-excluded volume baseline over a
+// full 24h of candles, beta-adjusted residual momentum, CVD + trade-size
+// skew, range-weighted close strength, walls scored relative to the book with
+// persistence age, futures positioning (funding/OI/L-S), listing age, the
+// uncapped score with ranked GO firing, a portfolio guard with a kill switch,
+// regime resets of the cooldown ledger, and a hot/cold priority kline pump.
 
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { fileURLToPath } from "node:url";
 import { Server, type Socket } from "socket.io";
 import {
   CooldownLedger,
+  PortfolioGuard,
   V2,
   assessRow,
   atrPctFromCandles,
+  atrWindow,
   btcModeFor,
   stablecoinLike,
+  type BtcMode,
   type V2Wall,
 } from "../../src/lib/market/v2-engine";
+import {
+  anomalyScore,
+  analyzeDepth,
+  betaFromCloses,
+  cvdSlope,
+  isJunkBase,
+  listingAgeDays,
+  median,
+  rankForSignalCut,
+  sizeSpike,
+  trackWallAge,
+  volumeBaseline,
+  type WallTrack,
+} from "../../src/lib/market/baseline";
 import type { BtcContext, RadarRowV2 } from "../../src/lib/market/types";
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -40,10 +68,16 @@ const PORT = 3003;
 // 418/429 bans are per-IP and handled with hard, doubling backoff.
 const HOSTS = ["https://data-api.binance.vision", "https://api.binance.com", "https://api4.binance.com"];
 const SCAN_INTERVAL_MS = 5_000; // compute + emit cadence (no network)
-const UNIVERSE_LIMIT = 40;
+const UNIVERSE_LIMIT = 60; // §2.2 — anomaly-ranked universe (was 40 by absolute volume)
 const UNIVERSE_REFRESH_MS = 5 * 60_000;
-const KLINE_LIMIT = 60; // 60 × 1m = one hour of candles
-const STATS_REFRESH_MS = 60_000; // 24h ticker stats cadence
+const KLINE_LIMIT = 288; // §2.3 — 24h of 1m candles (kline weight class barely moves: 1→2)
+const STATS_REFRESH_MS = 30_000; // §7 — halved; change24h now comes from candles, this is belt-and-braces
+// §2.2 universe liquidity gates — dust and one-print tapes never pump honestly.
+const UNIVERSE_MIN_QUOTE_VOLUME = 2_000_000;
+const UNIVERSE_MIN_TRADES_24H = 5_000;
+// §4 futures positioning (fapi.binance.com — separate weight pool, no key).
+const FUTURES_TICK_MS = 2_500;
+const FUTURES_TTL_MS = 60_000;
 const SIGNAL_COOLDOWN_MS = 10 * 60_000; // per pair+type
 const MAX_SIGNALS_PER_SCAN = 6;
 const OUTCOME_HORIZON_MS = 60 * 60_000;
@@ -93,6 +127,13 @@ type RadarRow = {
   signal: RadarSignal;
   spark: number[];
   atrPct: number | null;
+  // V2.1 feeds computed in toRow, consumed by assessRow (§2.3/§3.4/§4).
+  beta?: number | null;
+  residChange5m?: number | null;
+  residChange15m?: number | null;
+  cvdSlope15m?: number | null;
+  avgTradeSizeSpike?: number | null;
+  historyBlocks?: number | null;
   v2: RadarRowV2 | null;
 };
 
@@ -134,6 +175,7 @@ type TrackedSignal = {
   tp1: number | null;
   tp2: number | null;
   atrPct: number | null;
+  riskPct: number | null; // §5.2 — the plan's own risk %, to grade outcomes in R units
   // outcome tracking
   sentNew: boolean;
   sent5m: boolean;
@@ -192,19 +234,9 @@ async function binanceFetch(path: string, timeoutMs = 10_000): Promise<unknown> 
 }
 
 // ── Universe filtering (junk that never pumps) ───────────────────────────────
-
-const STABLE_BASES = new Set(["USDT", "USDC", "FDUSD", "DAI", "TUSD", "USDP", "BUSD", "BFUSD", "USDS"]);
-const FIAT_BASES = new Set([
-  "EUR", "GBP", "BRL", "AUD", "TRY", "NGN", "UAH", "ARS", "MXN", "ZAR", "PLN", "CZK", "HUF", "ILS",
-]);
-const LEVERAGED_SUFFIXES = ["UP", "DOWN", "BULL", "BEAR"];
-const PEGGED_BASES = new Set([
-  "RLUSD", "USD1", "USDE", "USD0", "PYUSD", "EURC", "USDD", "FRAX", "LUSD", "GUSD", "XUSD", "RWUSD", "XAUT", "PAXG",
-]);
-
-function isBStock(base: string): boolean {
-  return base.length >= 3 && base.length <= 6 && base.endsWith("B");
-}
+// §2.1: the blacklist lives in baseline.ts (isJunkBase) — EXACT matches only.
+// The old suffix heuristics here silently killed JUP, BNB, SHIB, ARB, CKB…
+// while catching exactly zero real leveraged tokens (those are delisted).
 
 // ── Scanner state ────────────────────────────────────────────────────────────
 
@@ -213,6 +245,7 @@ type Ticker24h = {
   lastPrice?: unknown;
   quoteVolume?: unknown;
   priceChangePercent?: unknown;
+  count?: unknown; // trades in the last 24h — the §2.2 universe gate
 };
 
 // Binance kline: [openTime, open, high, low, close, volume, closeTime,
@@ -234,12 +267,38 @@ const cooldowns = new Map<string, number>(); // `${pair}:${type}` → last fired
 
 const pairRooms = new Map<string, Set<string>>(); // pair → socket ids
 const pairMissing = new Map<string, number>(); // pair → last time we verified it doesn't exist
-type Walls = { at: number; ask: { price: number; valueUsd: number } | null; bid: { price: number; valueUsd: number } | null };
+// §2.5/§3.2/§4 — the book relative to ITSELF: the wall vs the band depth it
+// sits in, the top-of-book spread, and the ask runway to TP2 — not just the
+// biggest single level in a ±2% band.
+type Walls = {
+  at: number;
+  ask: { price: number; valueUsd: number } | null;
+  bid: { price: number; valueUsd: number } | null;
+  spreadBps: number | null;
+  askDepthUsd: number; // asks up to +7% — the TP2 exit runway
+  askWallToDepth: number | null; // biggest ask / total asks in the scan band (0..1)
+  bidWallToDepth: number | null;
+};
 const wallCache = new Map<string, Walls>();
+// §4 wall persistence — a wall that appeared seconds ago is probably spoofed;
+// age is what separates a real level from paint.
+const wallTracks = new Map<string, WallTrack>();
 const wallBreaks = new Map<string, { wallPrice: number; aboveSince: number | null }>();
 // Candidates worth spending depth requests on — refreshed every scan.
 let wallCandidates: string[] = [];
 const ledger = new CooldownLedger();
+// §10: a BTC regime flip voids directional blocks earned in the old regime.
+let lastBtcMode: BtcMode | null = null;
+// §4 futures positioning cache (funding / OI / L-S ratio), 60s TTL, paced fill.
+type FuturesData = { at: number; funding: number | null; oi: number | null; ls: number | null };
+const futuresCache = new Map<string, FuturesData>();
+// §4 listing age — days since the pair's first Binance daily candle.
+const listingAge = new Map<string, number>();
+// §5.2 portfolio guard — one book, not N independent bets.
+const guard = new PortfolioGuard();
+const guardWarnAt = new Map<string, number>(); // pair → last guard warn (10-min damper)
+// §5.4 diagnostics — size of the hot kline rotation, exposed on /health.
+let hotPairCount = 0;
 let btcContext: BtcContext | null = null;
 
 let lastSnapshot: RadarSnapshot | null = null;
@@ -266,6 +325,102 @@ function trackRequest() {
   requestTimestamps.push(now);
   requestTimestamps = requestTimestamps.filter((t) => now - t < 60_000);
 }
+
+// ── Persistence (audit §2.2 / §4) ─────────────────────────────────────────────
+//
+// Two tiny JSON files under mini-services/radar/data/: the 24h-quoteVolume
+// history that powers anomaly-based universe ranking, and listing ages. Both
+// are best-effort — a failed write only degrades ranking to absolute volume,
+// never the scan itself.
+
+const DATA_DIR = fileURLToPath(new URL("./data", import.meta.url));
+const VOL_HISTORY_PATH = `${DATA_DIR}/vol-history.json`;
+const LISTING_AGE_PATH = `${DATA_DIR}/listing-age.json`;
+const VOL_SNAPSHOT_MIN_MS = 3 * 60 * 60_000; // one sample per 3h → 56 samples ≈ 7 days
+const VOL_HISTORY_MAX_SAMPLES = 56;
+const VOL_HISTORY_MAX_PAIRS = 400;
+
+const volHistory = new Map<string, number[]>(); // pair → 24h quoteVolume samples
+let volHistorySnapAt = 0;
+
+function loadJsonMap(path: string): Map<string, unknown> {
+  const out = new Map<string, unknown>();
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) out.set(key, value);
+    }
+  } catch {
+    /* absent or corrupt — first boot simply ranks by absolute volume */
+  }
+  return out;
+}
+
+function persistJsonMap(path: string, entries: Iterable<[string, unknown]>): void {
+  try {
+    mkdirSync(DATA_DIR, { recursive: true });
+    const tmp = `${path}.tmp`;
+    writeFileSync(tmp, JSON.stringify(Object.fromEntries(entries)));
+    renameSync(tmp, path); // atomic-ish: readers see old or new, never half
+  } catch {
+    /* best-effort only */
+  }
+}
+
+function loadVolHistory(): void {
+  for (const [pair, samples] of loadJsonMap(VOL_HISTORY_PATH)) {
+    if (!Array.isArray(samples)) continue;
+    const clean = samples
+      .filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v > 0)
+      .slice(-VOL_HISTORY_MAX_SAMPLES);
+    if (clean.length > 0) volHistory.set(pair, clean);
+  }
+}
+
+function persistVolHistory(): void {
+  persistJsonMap(VOL_HISTORY_PATH, volHistory.entries());
+}
+
+function loadListingAge(): void {
+  for (const [pair, age] of loadJsonMap(LISTING_AGE_PATH)) {
+    if (typeof age === "number" && Number.isFinite(age) && age >= 0) listingAge.set(pair, age);
+  }
+}
+
+function persistListingAge(): void {
+  persistJsonMap(LISTING_AGE_PATH, listingAge.entries());
+}
+
+// §2.2: one 24h-quoteVolume sample per pair every 3h (56 samples ≈ 7 days),
+// top ~400 pairs by volume, persisted best-effort — this is the history the
+// anomaly ranking measures "money arriving HERE, now" against.
+function snapshotVolHistory(rows: Ticker24h[]): void {
+  const now = Date.now();
+  if (now - volHistorySnapAt < VOL_SNAPSHOT_MIN_MS) return;
+  volHistorySnapAt = now;
+  const top = [...rows].sort((a, b) => num(b.quoteVolume) - num(a.quoteVolume)).slice(0, VOL_HISTORY_MAX_PAIRS);
+  const keep = new Set<string>();
+  for (const row of top) {
+    const symbol = typeof row.symbol === "string" ? row.symbol.toUpperCase() : "";
+    const qv = num(row.quoteVolume);
+    if (!symbol || qv <= 0) continue;
+    keep.add(symbol);
+    const samples = volHistory.get(symbol) ?? [];
+    samples.push(qv);
+    volHistory.set(symbol, samples.slice(-VOL_HISTORY_MAX_SAMPLES));
+  }
+  // Churn control: pairs that fell out of the top-400 long ago stop accruing.
+  if (volHistory.size > VOL_HISTORY_MAX_PAIRS * 2) {
+    for (const pair of volHistory.keys()) {
+      if (!keep.has(pair)) volHistory.delete(pair);
+    }
+  }
+  persistVolHistory();
+}
+
+mkdirSync(DATA_DIR, { recursive: true });
+loadVolHistory();
+loadListingAge();
 
 // ── Servers ─────────────────────────────────────────────────────────────────
 
@@ -309,6 +464,8 @@ const restServer = createServer((req: IncomingMessage, res: ServerResponse) => {
         usedWeight: lastUsedWeight,
         paceMs: pumpPaceMs(),
         candles: candles.size,
+        futures: futuresCache.size, // §4 — pairs with cached funding/OI/L-S data
+        hotPairs: hotPairCount, // §5.4 — current hot kline rotation size
         statsAgeSec: statsUpdatedAt > 0 ? Math.round((Date.now() - statsUpdatedAt) / 1000) : null,
         bannedFor: Math.max(0, bannedUntil - Date.now()),
       }),
@@ -390,6 +547,9 @@ function snapshotForClients(): RadarSnapshot {
 //   Buy pressure    up to 20 pts (taker-buy share, 50% → 0, 80%+ → 20)
 //   Close strength  up to 15 pts — closes near candle highs mean buyers are
 //                   paying up into strength, not fading it.
+// §10: the composite is UNCAPPED internally (the bounded components keep it
+// ~0–100 in practice) — ranking consumers must never see a clipped value;
+// only the display caps at 100.
 function pumpScore(
   rvol: number,
   tradeSpike: number,
@@ -408,7 +568,8 @@ function pumpScore(
   if (change1m > 0 && change1m >= change5m) momentumPts += 7;
   const buyPts = 20 * clamp01((buyPct - 50) / 30);
   const closePts = 15 * clamp01(closeStrength);
-  return Math.round(Math.min(100, Math.max(0, rvolPts + tradePts + momentumPts + buyPts + closePts)));
+  // §2.5/§10: uncapped, floored at 0 — never Math.min(100, …).
+  return Math.round(Math.max(0, rvolPts + tradePts + momentumPts + buyPts + closePts));
 }
 
 function badgeFor(score: number, rvol: number, change24h: number, belowHighPct: number): RadarBadge | null {
@@ -431,7 +592,13 @@ function decideSignal(row: RadarRow): RadarSignal {
 
 // ── Row construction from a ticker + klines ──────────────────────────────────
 
-function toRow(ticker: Ticker24h, klines: Kline[]): RadarRow | null {
+// §3.4: BTC context for beta/residual math — scan() builds BTC's row first
+// and hands its closes and own 5m/15m moves to every other row. BTC itself
+// gets nulls (its residual vs itself is zero by construction, so the engine
+// scores its raw move).
+type BtcRowContext = { closes: number[] | null; change5m: number | null; change15m: number | null };
+
+function toRow(ticker: Ticker24h, klines: Kline[], btc: BtcRowContext): RadarRow | null {
   const pair = typeof ticker.symbol === "string" ? ticker.symbol.toUpperCase() : "";
   if (!pair || !pair.endsWith("USDT") || klines.length < 16) return null;
   const closes = klines.map((k) => num(k[4]));
@@ -449,41 +616,52 @@ function toRow(ticker: Ticker24h, klines: Kline[]): RadarRow | null {
   const change5m = move(last - 5, last);
   const change15m = move(last - 15, last);
 
-  // Twelve 5-minute blocks in the last hour = the baseline.
-  const blocks: number[] = [];
-  const tradeBlocks: number[] = [];
-  for (let start = 0; start + 5 <= quotes.length; start += 5) {
-    blocks.push(quotes.slice(start, start + 5).reduce((a, b) => a + b, 0));
-    tradeBlocks.push(trades.slice(start, start + 5).reduce((a, b) => a + b, 0));
-  }
-  const volAvg5m = blocks.length > 0 ? blocks.reduce((a, b) => a + b, 0) / blocks.length : 0;
-  const tradeAvg5m = tradeBlocks.length > 0 ? tradeBlocks.reduce((a, b) => a + b, 0) / tradeBlocks.length : 0;
   const vol5m = quotes.slice(-5).reduce((a, b) => a + b, 0);
   const trades5m = trades.slice(-5).reduce((a, b) => a + b, 0);
+
+  // §2.3: 5m blocks over the FULL 24h candle window, bucketed by open time.
+  // volumeBaseline() then picks the time-of-day median with the last 30 min
+  // self-excluded — the spike never dilutes its own baseline and 4am quiet
+  // no longer reads as an anomaly. The old mean-over-prior-hour baseline did
+  // both.
+  const blockAgg = new Map<number, { qv: number; trades: number }>();
+  for (const k of klines) {
+    const t = Math.floor(num(k[0]) / 300_000) * 300_000;
+    const block = blockAgg.get(t) ?? { qv: 0, trades: 0 };
+    block.qv += num(k[7]);
+    block.trades += num(k[8]);
+    blockAgg.set(t, block);
+  }
+  const blocks = [...blockAgg.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([t, block]) => ({ t, qv: block.qv, trades: block.trades }));
+  const volumeBase = volumeBaseline(blocks, 6, 6);
+  const volAvg5m = volumeBase.baseline; // field name kept for payload compat
+  const historyBlocks = volumeBase.blocks; // ≥20 usable blocks = trustworthy rvol
   const rvol = volAvg5m > 0 ? vol5m / volAvg5m : 0;
-  const tradeSpike = tradeAvg5m > 0 ? trades5m / tradeAvg5m : 0;
+  // tradeSpike baseline: MEDIAN trades per usable 5m block (same window),
+  // floored at 1 so a dead tape can't manufacture an infinite spike.
+  const tradeBase5m = Math.max(1, median(blocks.slice(0, Math.max(0, blocks.length - 6)).map((b) => b.trades)));
+  const tradeSpike = trades5m / tradeBase5m;
 
   const buyQuote5m = takerBuys.slice(-5).reduce((a, b) => a + b, 0);
   const buyPct = vol5m > 0 ? (buyQuote5m / vol5m) * 100 : 50;
 
-  // Close strength: average (close − low) / (high − low) over the last 5
-  // candles. High == low (flat candle) counts as neutral 0.5.
-  let strengthSum = 0;
-  let strengthCount = 0;
-  for (const k of klines.slice(-5)) {
-    const high = num(k[2]);
-    const low = num(k[3]);
-    const close = num(k[4]);
-    if (high > low) {
-      strengthSum += (close - low) / (high - low);
-      strengthCount += 1;
-    }
-  }
-  const closeStrength = strengthCount > 0 ? strengthSum / strengthCount : 0.5;
-
   const price = closes.length > 0 ? closes[closes.length - 1] ?? 0 : num(ticker.lastPrice);
   if (price <= 0) return null;
-  const sessionHigh = Math.max(sessionHighs.get(pair) ?? 0, ...closes, price);
+
+  // §2.2/§7: the 24h change from the candles themselves — the ticker's
+  // priceChangePercent lags up to a full stats cycle and drifts from the tape
+  // the engine actually scores. Fallback (< ~287 bars, i.e. a new listing):
+  // the ticker value, documented and honest.
+  const firstOpen = num(klines[0]?.[1]);
+  const change24h =
+    klines.length >= 287 && firstOpen > 0 ? ((price - firstOpen) / firstOpen) * 100 : num(ticker.priceChangePercent);
+
+  // §2.6: the 24h kline window IS the session — the high is restart-proof and
+  // can no longer depend on process uptime. The map stays only as a
+  // diagnostic mirror, never larger than the candle window.
+  const sessionHigh = Math.max(...klines.map((k) => num(k[2])), price);
   sessionHighs.set(pair, sessionHigh);
   const belowHighPct = sessionHigh > 0 ? ((sessionHigh - price) / sessionHigh) * 100 : 0;
 
@@ -492,15 +670,60 @@ function toRow(ticker: Ticker24h, klines: Kline[]): RadarRow | null {
   lastRvol.set(pair, rvol);
   const spikeFalling = prevRvol !== null && prevRvol >= 3 && rvol < 1.5;
 
-  const score = pumpScore(rvol, tradeSpike, change1m, change5m, change15m, buyPct, closeStrength);
-  const change24h = num(ticker.priceChangePercent);
-  const badge = badgeFor(score, rvol, change24h, belowHighPct);
-
-  // V2 inputs computed alongside the row: ATR from the candle highs/lows.
+  // ATR FIRST (§4) — the range weights below and the V2 stop both consume it.
   const atrPct = atrPctFromCandles(
     klines.map((k) => ({ high: num(k[2]), low: num(k[3]), close: num(k[4]) })),
     14,
   );
+
+  // The trailing kline is the still-forming minute — closed-bar statistics
+  // (close strength, CVD, trade sizes) must exclude it or the partial minute
+  // quietly dilutes every baseline.
+  const lastBar = klines[klines.length - 1];
+  const closedBars = lastBar !== undefined && lastBar[6] > Date.now() ? klines.slice(0, -1) : klines;
+
+  // §4 range-weighted close strength: a tight doji contributes almost
+  // nothing, a wide impulse candle counts fully.
+  let strengthSum = 0;
+  let strengthCount = 0;
+  for (const k of closedBars.slice(-5)) {
+    const high = num(k[2]);
+    const low = num(k[3]);
+    const close = num(k[4]);
+    const raw = high > low ? (close - low) / (high - low) : 0.5;
+    const rangePct = close > 0 ? ((high - low) / close) * 100 : 0;
+    const weight = atrPct !== null && atrPct > 0 ? Math.min(1, rangePct / (2 * atrPct)) : 0.5;
+    strengthSum += 0.5 + (raw - 0.5) * weight;
+    strengthCount += 1;
+  }
+  const closeStrength = strengthCount > 0 ? strengthSum / strengthCount : 0.5;
+
+  // §4 CVD slope over the last 15 closed bars: Σ(takerBuy − takerSell) / Σvol.
+  const cvdSlope15m = cvdSlope(
+    closedBars.slice(-15).map((k) => ({ qv: num(k[7]), tb: num(k[10]) })),
+    15,
+  );
+
+  // §4 trade-size skew: avg USD/trade over the last 5 closed bars vs the
+  // median per-bar size of the prior 60 (bars with 0 trades skipped).
+  const lastBars = closedBars.slice(-5);
+  const sizeVol = lastBars.reduce((a, k) => a + num(k[7]), 0);
+  const sizeCount = lastBars.reduce((a, k) => a + num(k[8]), 0);
+  const priorSizes: number[] = [];
+  for (const k of closedBars.slice(-65, -5)) {
+    const t = num(k[8]);
+    if (t > 0) priorSizes.push(num(k[7]) / t);
+  }
+  const avgTradeSizeSpike =
+    sizeCount > 0 ? sizeSpike(sizeVol / sizeCount, priorSizes.length > 0 ? median(priorSizes) : 0) : null;
+
+  // §3.4 beta + residual momentum — the engine stops rewarding plain beta.
+  const beta = btc.closes !== null ? betaFromCloses(closes.slice(-60), btc.closes, 40) : null;
+  const residChange5m = beta !== null && btc.change5m !== null ? change5m - beta * btc.change5m : null;
+  const residChange15m = beta !== null && btc.change15m !== null ? change15m - beta * btc.change15m : null;
+
+  const score = pumpScore(rvol, tradeSpike, change1m, change5m, change15m, buyPct, closeStrength);
+  const badge = badgeFor(score, rvol, change24h, belowHighPct);
 
   const row: RadarRow = {
     pair,
@@ -527,6 +750,12 @@ function toRow(ticker: Ticker24h, klines: Kline[]): RadarRow | null {
     signal: "flat",
     spark: closes.slice(-60),
     atrPct,
+    beta,
+    residChange5m,
+    residChange15m,
+    cvdSlope15m,
+    avgTradeSizeSpike,
+    historyBlocks,
     v2: null,
   };
   row.signal = decideSignal(row);
@@ -550,22 +779,38 @@ function toRow(ticker: Ticker24h, klines: Kline[]): RadarRow | null {
 async function refreshUniverse(): Promise<void> {
   const payload = await binanceFetch("/api/v3/ticker/24hr", 20_000);
   if (!Array.isArray(payload)) throw new Error("Unexpected Binance payload");
-  const rows = (payload as Ticker24h[])
-    .filter((row) => {
-      const symbol = typeof row.symbol === "string" ? row.symbol.toUpperCase() : "";
-      if (!symbol.endsWith("USDT")) return false;
-      const base = symbol.slice(0, -4);
-      if (!base || STABLE_BASES.has(base) || FIAT_BASES.has(base) || PEGGED_BASES.has(base)) return false;
-      if (isBStock(base)) return false;
-      if (LEVERAGED_SUFFIXES.some((suffix) => base.endsWith(suffix))) return false;
-      return num(row.quoteVolume) > 0;
-    })
-    .sort((a, b) => num(b.quoteVolume) - num(a.quoteVolume))
-    .slice(0, UNIVERSE_LIMIT);
+  // §2.1: exact-match junk filter from baseline.ts — the old suffix
+  // heuristics silently killed JUP, BNB, SHIB, ARB…
+  const usdtRows: Ticker24h[] = [];
+  for (const row of payload as Ticker24h[]) {
+    const symbol = typeof row.symbol === "string" ? row.symbol.toUpperCase() : "";
+    if (!symbol.endsWith("USDT")) continue;
+    const base = symbol.slice(0, -4);
+    if (!base || isJunkBase(base)) continue;
+    usdtRows.push(row);
+  }
+  // §2.2 candidates: liquidity-gated (≥$2M 24h quote volume AND ≥5k trades)…
+  const candidates = usdtRows
+    .filter((row) => num(row.quoteVolume) >= UNIVERSE_MIN_QUOTE_VOLUME && num(row.count) >= UNIVERSE_MIN_TRADES_24H)
+    .map((row) => {
+      const symbol = String(row.symbol).toUpperCase();
+      return { symbol, qv: num(row.quoteVolume), history: volHistory.get(symbol) ?? [] };
+    });
+  // …ranked by volume ANOMALY vs the persisted 7-day history — money arriving
+  // HERE, now, which absolute volume never found. Pairs with <2 history
+  // samples rank after, by absolute volume: big-and-quiet beats unknown. The
+  // snapshot is taken AFTER ranking so history stays "current vs PAST".
+  const ranked = candidates
+    .filter((c) => c.history.length >= 2)
+    .sort((a, b) => anomalyScore(b.qv, b.history) - anomalyScore(a.qv, a.history) || b.qv - a.qv);
+  const unranked = candidates.filter((c) => c.history.length < 2).sort((a, b) => b.qv - a.qv);
+  const selected = new Set([...ranked, ...unranked].slice(0, UNIVERSE_LIMIT).map((c) => c.symbol));
+  snapshotVolHistory(usdtRows);
   const nextUniverse: string[] = [];
   const nextStats = new Map<string, Ticker24h>();
-  for (const row of rows) {
+  for (const row of usdtRows) {
     const symbol = String(row.symbol).toUpperCase();
+    if (!selected.has(symbol)) continue;
     nextUniverse.push(symbol);
     nextStats.set(symbol, row);
   }
@@ -592,15 +837,40 @@ async function refreshUniverse(): Promise<void> {
   stats.clear();
   for (const [pair, row] of merged) stats.set(pair, row);
   universeUpdatedAt = Date.now();
-  // Drop candles for pairs that left the universe (keep subscribed extras).
+  // Drop state for pairs that left the universe (keep subscribed extras).
   const keep = new Set([...nextUniverse, ...pairRooms.keys()]);
   for (const pair of candles.keys()) {
     if (!keep.has(pair)) {
       candles.delete(pair);
       sessionHighs.delete(pair);
       lastRvol.delete(pair);
+      wallTracks.delete(pair);
+      futuresCache.delete(pair);
     }
   }
+  // §4 listing age: one paced daily-kline fetch (startTime=0 → the pair's
+  // FIRST candle) per pair on universe entry — new listings have meaningless
+  // baselines and the engine gates on exactly that.
+  let ageAdded = false;
+  for (const pair of nextUniverse) {
+    if (listingAge.has(pair)) continue;
+    if (bannedUntil > Date.now()) break;
+    try {
+      const daily = await binanceFetch(`/api/v3/klines?symbol=${pair}&interval=1d&limit=1&startTime=0`, 10_000);
+      if (Array.isArray(daily)) {
+        const firstOpenMs = num((daily as Kline[])[0]?.[0]);
+        const age = listingAgeDays(firstOpenMs > 0 ? firstOpenMs : null);
+        if (age !== null) {
+          listingAge.set(pair, age);
+          ageAdded = true;
+        }
+      }
+    } catch {
+      /* absent pair or network hiccup — retried on the next refresh */
+    }
+    await sleep(pumpPaceMs());
+  }
+  if (ageAdded) persistListingAge();
 }
 
 function pumpPaceMs(): number {
@@ -611,15 +881,43 @@ function pumpPaceMs(): number {
 }
 
 async function klinePumpLoop(): Promise<void> {
-  let cursor = 0;
+  let hotCursor = 0;
+  let coldCursor = 0;
+  let tick = 0;
   const failureStreaks = new Map<string, number>();
   while (!stopped && isCurrentGeneration()) {
     await sleep(pumpPaceMs());
     if (bannedUntil > Date.now()) continue;
-    const rotation = [...universe, ...pairRooms.keys()];
-    if (rotation.length === 0) continue;
-    const pair = rotation[cursor % rotation.length];
-    cursor += 1;
+    // §5.4 hot/cold split, recomputed from the last snapshot every tick: hot =
+    // watch-score / ≥2× rvol / subscribed — the money is moving THERE, so hot
+    // candles refresh on (almost) every rotation tick while the cold tail is
+    // served only every 3rd. Same one-request-per-tick budget; the freshness
+    // goes where it counts.
+    const rowByPair = new Map<string, RadarRow>();
+    if (lastSnapshot) for (const r of lastSnapshot.rows) rowByPair.set(r.pair, r);
+    const hot: string[] = [];
+    const cold: string[] = [];
+    for (const pair of universe) {
+      const row = rowByPair.get(pair);
+      if (pairRooms.has(pair) || (row !== undefined && (row.score >= V2.watchScore || row.rvol >= 2))) hot.push(pair);
+      else cold.push(pair);
+    }
+    for (const extra of pairRooms.keys()) {
+      if (!universe.includes(extra)) hot.push(extra); // subscribed extras are always hot
+    }
+    hotPairCount = hot.length;
+    tick += 1;
+    // Cold is served on every 3rd tick — or always while no hot rotation
+    // exists, because an idle pump wastes the budget it was granted.
+    const serveCold = cold.length > 0 && (tick % 3 === 0 || hot.length === 0);
+    let pair: string | undefined;
+    if (serveCold) {
+      pair = cold[coldCursor % cold.length];
+      coldCursor += 1;
+    } else if (hot.length > 0) {
+      pair = hot[hotCursor % hot.length];
+      hotCursor += 1;
+    }
     if (!pair) continue;
     try {
       const payload = await binanceFetch(
@@ -709,29 +1007,25 @@ const WALL_CANDIDATE_LIMIT = 12;
 async function fetchWalls(pair: string, price: number): Promise<Walls | null> {
   if (price <= 0) return null;
   try {
-    const payload = (await binanceFetch(`/api/v3/depth?symbol=${pair}&limit=20`, 8_000)) as {
+    // §2.5/§3.2/§4: 100 levels through analyzeDepth — the wall vs the book it
+    // sits in (wallToDepth), the top-of-book spread, and the ask runway to
+    // TP2, instead of just the biggest level in a ±2% band.
+    const payload = (await binanceFetch(`/api/v3/depth?symbol=${pair}&limit=100`, 8_000)) as {
       asks?: Array<[string, string]>;
       bids?: Array<[string, string]>;
     };
     const asks = Array.isArray(payload.asks) ? payload.asks : [];
     const bids = Array.isArray(payload.bids) ? payload.bids : [];
-    let bestAsk: { price: number; valueUsd: number } | null = null;
-    for (const [rawPrice, rawQty] of asks) {
-      const askPrice = num(rawPrice);
-      const qty = num(rawQty);
-      if (askPrice <= price || askPrice > price * (1 + V2.wallScanPct / 100)) continue;
-      const valueUsd = askPrice * qty;
-      if (!bestAsk || valueUsd > bestAsk.valueUsd) bestAsk = { price: askPrice, valueUsd };
-    }
-    let bestBid: { price: number; valueUsd: number } | null = null;
-    for (const [rawPrice, rawQty] of bids) {
-      const bidPrice = num(rawPrice);
-      const qty = num(rawQty);
-      if (bidPrice >= price || bidPrice < price * (1 - V2.wallScanPct / 100)) continue;
-      const valueUsd = bidPrice * qty;
-      if (!bestBid || valueUsd > bestBid.valueUsd) bestBid = { price: bidPrice, valueUsd };
-    }
-    const walls: Walls = { at: Date.now(), ask: bestAsk, bid: bestBid };
+    const depth = analyzeDepth(asks, bids, price, V2.wallScanPct);
+    const walls: Walls = {
+      at: Date.now(),
+      ask: depth.askWall,
+      bid: depth.bidWall,
+      spreadBps: depth.spreadBps,
+      askDepthUsd: depth.askDepthUsd,
+      askWallToDepth: depth.askWallToDepth,
+      bidWallToDepth: depth.bidWallToDepth,
+    };
     wallCache.set(pair, walls);
     return walls;
   } catch {
@@ -782,6 +1076,82 @@ async function wallPumpLoop(): Promise<void> {
     const price = row?.price ?? 0;
     if (price <= 0) continue;
     await fetchWalls(pair, price);
+  }
+}
+
+// ── Futures positioning (audit §4) ───────────────────────────────────────────
+//
+// fapi.binance.com public endpoints, no key, separate weight pool from the
+// spot hosts. One pair per ~2.5s tick over the current wall candidates (+
+// subscribed pairs) with a 60s TTL: funding, the 15m open-interest change and
+// the global long/short account ratio. Failures set nulls silently — the
+// engine's filter just reports "no data" for that field.
+
+async function futuresFetch(path: string): Promise<unknown | null> {
+  try {
+    const response = await fetch(`https://fapi.binance.com${path}`, {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!response.ok) return null;
+    return (await response.json()) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function numOrNull(value: unknown): number | null {
+  const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+async function refreshFutures(pair: string): Promise<void> {
+  // Premium index → funding. 0 is a REAL value (neutral funding), so the
+  // field is only null when the fetch or the shape failed.
+  let funding: number | null = null;
+  const premium = await futuresFetch(`/fapi/v1/premiumIndex?symbol=${pair}`);
+  if (premium !== null && typeof premium === "object") {
+    const rate = numOrNull((premium as { lastFundingRate?: unknown }).lastFundingRate);
+    funding = rate !== null ? rate * 100 : null;
+  }
+  // OI history (5m × 4 buckets) → 15m open-interest change, %.
+  let oi: number | null = null;
+  const oiHist = await futuresFetch(`/futures/data/openInterestHist?symbol=${pair}&period=5m&limit=4`);
+  if (Array.isArray(oiHist) && oiHist.length >= 2) {
+    const rows = oiHist as Array<{ sumOpenInterestValue?: unknown }>;
+    const first = numOrNull(rows[0]?.sumOpenInterestValue);
+    const last = numOrNull(rows[rows.length - 1]?.sumOpenInterestValue);
+    if (first !== null && last !== null && first > 0) oi = ((last - first) / first) * 100;
+  }
+  // Global long/short account ratio — retail crowding fades fast.
+  let ls: number | null = null;
+  const lsRows = await futuresFetch(`/futures/data/globalLongShortAccountRatio?symbol=${pair}&period=5m&limit=1`);
+  if (Array.isArray(lsRows) && lsRows.length > 0) {
+    const ratio = numOrNull((lsRows[0] as { longShortRatio?: unknown })?.longShortRatio);
+    ls = ratio !== null && ratio > 0 ? ratio : null;
+  }
+  // `at` advances even on total failure — a spot-only listing must not be
+  // re-queried three times every 2.5s forever.
+  futuresCache.set(pair, { at: Date.now(), funding, oi, ls });
+}
+
+async function futuresLoop(): Promise<void> {
+  while (!stopped && isCurrentGeneration()) {
+    await sleep(FUTURES_TICK_MS);
+    if (bannedUntil > Date.now()) continue; // one egress IP — one ban
+    const rotation = [...new Set([...wallCandidates, ...pairRooms.keys()])];
+    if (rotation.length === 0) continue;
+    // First stale entry in rotation order — one pair per tick, ever.
+    let pick: string | null = null;
+    for (const pair of rotation) {
+      const cached = futuresCache.get(pair);
+      if (cached === undefined || Date.now() - cached.at > FUTURES_TTL_MS) {
+        pick = pair;
+        break;
+      }
+    }
+    if (pick === null) continue;
+    await refreshFutures(pick);
   }
 }
 
@@ -839,6 +1209,96 @@ function signalNote(type: SignalType, row: RadarRow): string {
 function detectSignals(rows: RadarRow[]): TrackedSignal[] {
   const now = Date.now();
   const fired: TrackedSignal[] = [];
+  // §5.2: the portfolio guard correlates candidates against every open
+  // position's spark.
+  const sparksMap = new Map<string, number[]>(rows.map((r) => [r.pair, r.spark] as const));
+
+  // Shared firing path — cooldown, the per-scan cap, ledger feeds. Returns
+  // whether the signal actually fired (the guard must only register real
+  // fires, never cap-blocked phantoms).
+  const fire = (row: RadarRow, type: SignalType): boolean => {
+    const key = `${row.pair}:${type}`;
+    const last = cooldowns.get(key) ?? 0;
+    const cooldownFor = type === "go_long" || type === "go_short" ? V2.signalRepeatMs : SIGNAL_COOLDOWN_MS;
+    if (now - last < cooldownFor) return false;
+    if (fired.length >= MAX_SIGNALS_PER_SCAN) return false;
+    // Direction-adjusted MFE/MAE run from the moment of the signal.
+    const v2Trade = type === "go_long" ? row.v2?.trade ?? null : type === "go_short" ? row.v2?.shortTrade ?? null : null;
+    fired.push({
+      id: `${row.pair}:${type}:${Math.floor(now / 60_000)}`,
+      pair: row.pair,
+      base: row.base,
+      type,
+      direction: DIRECTION[type],
+      score: type === "go_long" ? row.v2?.longScore ?? row.score : type === "go_short" ? row.v2?.shortScore ?? row.score : row.score,
+      price: row.price,
+      change24h: row.change24h,
+      rvol: row.rvol,
+      buyPct: row.buyPct,
+      volume24h: row.volume24h,
+      note: signalNote(type, row),
+      createdAt: now,
+      sl: v2Trade ? v2Trade.stop : null,
+      tp1: v2Trade ? v2Trade.tp1 : null,
+      tp2: v2Trade ? v2Trade.tp2 : null,
+      atrPct: v2Trade ? v2Trade.atrPct : null,
+      riskPct: v2Trade ? v2Trade.riskPct : null, // §5.2 — outcomes convert to R units
+      sentNew: false,
+      sent5m: false,
+      sent15m: false,
+      sent60m: false,
+      mfe: 0,
+      mae: 0,
+      final: false,
+    });
+    cooldowns.set(key, now);
+    // Feed the anti-flip-flop ledger.
+    if (BEARISH_TYPES.includes(type)) ledger.bearishSignal(row.pair, now);
+    if (type === "go_long") ledger.longSignal(row.pair, now);
+    if (type === "go_short") ledger.shortSignal(row.pair, now);
+    return true;
+  };
+
+  // §2.5/§10: GO candidates fire FIRST, in UNCAPPED v2-score order (shared
+  // rankForSignalCut), so the 6-per-scan cap can never eat the best trade in
+  // favor of informational signals that happened to sit earlier in row order.
+  const goCandidates = rankForSignalCut(
+    rows
+      .filter((r) => r.v2 !== null && (r.v2.verdict === "go_long" || r.v2.verdict === "go_short"))
+      .map((r) => ({
+        pair: r.pair,
+        score: r.v2 !== null && r.v2.verdict === "go_long" ? r.v2.longScore : (r.v2?.shortScore ?? 0),
+        row: r,
+      })),
+  );
+  for (const candidate of goCandidates) {
+    const row = candidate.row;
+    const side: "long" | "short" = row.v2?.verdict === "go_short" ? "short" : "long";
+    const type: SignalType = side === "long" ? "go_long" : "go_short";
+    // V2 gated signals — only when the cooldown ledger agrees and the repeat
+    // damper is quiet (unchanged semantics).
+    const ledgerOk =
+      side === "long"
+        ? ledger.longAllowed(row.pair, now) && !ledger.repeatLong(row.pair, now)
+        : ledger.shortAllowed(row.pair, now) && !ledger.repeatShort(row.pair, now);
+    if (!ledgerOk) continue;
+    // §5.2 portfolio guard — concurrency, correlation, kill switch.
+    const decision = guard.allow(row.pair, side, row.spark, sparksMap);
+    if (!decision.ok) {
+      // reason null = same pair already open — the cooldown owns that case.
+      if (decision.reason !== null) {
+        const lastWarn = guardWarnAt.get(row.pair) ?? 0;
+        if (now - lastWarn >= 10 * 60_000) {
+          guardWarnAt.set(row.pair, now);
+          console.warn(`[guard] ${type} on ${row.pair} skipped: ${decision.reason}`);
+        }
+      }
+      continue;
+    }
+    if (fire(row, type)) guard.register(row.pair, side, row.spark);
+  }
+
+  // Informational signals — unchanged rules, pump-score row order.
   for (const row of rows) {
     const candidates: SignalType[] = [];
     const flatDay = row.change24h >= -5 && row.change24h <= 8;
@@ -851,55 +1311,7 @@ function detectSignals(rows: RadarRow[]): TrackedSignal[] {
     if (row.belowHighPct >= 3 && row.rvol >= 2 && row.change5m < 0) candidates.push("dump_start");
     if (row.spikeFalling) candidates.push("spike_collapse");
 
-    // V2 gated signals — only when the seven-filter assessment says GO, the
-    // cooldown ledger agrees, and the repeat damper is quiet.
-    if (row.v2 && row.v2.verdict === "go_long" && ledger.longAllowed(row.pair, now) && !ledger.repeatLong(row.pair, now)) {
-      candidates.push("go_long");
-    }
-    if (row.v2 && row.v2.verdict === "go_short" && ledger.shortAllowed(row.pair, now) && !ledger.repeatShort(row.pair, now)) {
-      candidates.push("go_short");
-    }
-
-    for (const type of candidates) {
-      const key = `${row.pair}:${type}`;
-      const last = cooldowns.get(key) ?? 0;
-      const cooldownFor = type === "go_long" || type === "go_short" ? V2.signalRepeatMs : SIGNAL_COOLDOWN_MS;
-      if (now - last < cooldownFor) continue;
-      // Direction-adjusted MFE/MAE run from the moment of the signal.
-      const v2Trade = type === "go_long" ? row.v2?.trade ?? null : type === "go_short" ? row.v2?.shortTrade ?? null : null;
-      fired.push({
-        id: `${row.pair}:${type}:${Math.floor(now / 60_000)}`,
-        pair: row.pair,
-        base: row.base,
-        type,
-        direction: DIRECTION[type],
-        score: type === "go_long" ? row.v2?.longScore ?? row.score : type === "go_short" ? row.v2?.shortScore ?? row.score : row.score,
-        price: row.price,
-        change24h: row.change24h,
-        rvol: row.rvol,
-        buyPct: row.buyPct,
-        volume24h: row.volume24h,
-        note: signalNote(type, row),
-        createdAt: now,
-        sl: v2Trade ? v2Trade.stop : null,
-        tp1: v2Trade ? v2Trade.tp1 : null,
-        tp2: v2Trade ? v2Trade.tp2 : null,
-        atrPct: v2Trade ? v2Trade.atrPct : null,
-        sentNew: false,
-        sent5m: false,
-        sent15m: false,
-        sent60m: false,
-        mfe: 0,
-        mae: 0,
-        final: false,
-      });
-      cooldowns.set(key, now);
-      // Feed the anti-flip-flop ledger.
-      if (BEARISH_TYPES.includes(type)) ledger.bearishSignal(row.pair, now);
-      if (type === "go_long") ledger.longSignal(row.pair, now);
-      if (type === "go_short") ledger.shortSignal(row.pair, now);
-      if (fired.length >= MAX_SIGNALS_PER_SCAN) return fired;
-    }
+    for (const type of candidates) fire(row, type);
   }
   return fired;
 }
@@ -997,6 +1409,12 @@ async function gradeOutcomes(prices: Map<string, number>): Promise<void> {
       s.change60m = (lastPrice / s.price - 1) * 100;
       s.sent60m = true;
       s.final = true;
+      // §5.2: feed the portfolio guard's kill switch at the horizon, in units
+      // of risk — direction-adjusted pnl% over the plan's own risk%.
+      if (s.type === "go_long" || s.type === "go_short") {
+        const favorable = s.direction === "long" ? (s.change60m ?? 0) : -(s.change60m ?? 0);
+        guard.registerOutcome(favorable / (s.riskPct || 1));
+      }
     }
 
     if (s.sent5m || s.sent15m || s.sent60m || s.final) {
@@ -1123,11 +1541,39 @@ async function scan(): Promise<void> {
     const pairs = [...new Set([...universe, ...pairRooms.keys()])];
     const rows: RadarRow[] = [];
     const prices = new Map<string, number>();
+
+    // §3.4: BTC's tape FIRST — every other row's beta/residual momentum
+    // consumes BTC's closes and 5m/15m moves, and the regime filter consumes
+    // BTC's own 15m ATR. BTC itself gets a null context (its residual vs
+    // itself is zero by construction, so the engine scores its raw move).
+    const btcKlines = candles.get("BTCUSDT") ?? null;
+    const btcTicker = stats.get("BTCUSDT") ?? null;
+    const btcRow =
+      btcKlines !== null && btcTicker !== null
+        ? toRow(btcTicker, btcKlines, { closes: null, change5m: null, change15m: null })
+        : null;
+    const btcCloses = btcKlines !== null ? btcKlines.map((k) => num(k[4])).slice(-60) : null;
+    const btcAtr1m =
+      btcKlines !== null
+        ? atrPctFromCandles(btcKlines.map((k) => ({ high: num(k[2]), low: num(k[3]), close: num(k[4]) })), 14)
+        : null;
+    const btcAtr15m = atrWindow(btcAtr1m, 15);
+    const btcFeed: BtcRowContext = {
+      closes: btcCloses,
+      change5m: btcRow?.change5m ?? null,
+      change15m: btcRow?.change15m ?? null,
+    };
+
     for (const pair of pairs) {
+      if (pair === "BTCUSDT" && btcRow !== null) {
+        rows.push(btcRow);
+        prices.set(pair, btcRow.price);
+        continue;
+      }
       const k = candles.get(pair);
       const ticker = stats.get(pair);
       if (!k || !ticker) continue;
-      const row = toRow(ticker, k);
+      const row = toRow(ticker, k, btcFeed);
       if (row) {
         rows.push(row);
         prices.set(row.pair, row.price);
@@ -1142,9 +1588,13 @@ async function scan(): Promise<void> {
     }
 
     // ── BTC market regime — the filter every long/short answer runs through.
-    const btcRow = rows.find((r) => r.pair === "BTCUSDT") ?? null;
+    // §3.4: the regime bar is BTC's own 15m ATR, not a fixed ±0.3%.
     if (btcRow) {
-      const mode = btcModeFor(btcRow.change15m) ?? "flat";
+      const mode = btcModeFor(btcRow.change15m, btcAtr15m) ?? "flat";
+      // §10: a regime flip voids directional blocks earned in the old regime —
+      // a dump block must not haunt the first hour of a bull flip.
+      if (lastBtcMode !== null && lastBtcMode !== mode) ledger.resetBlocks();
+      lastBtcMode = mode;
       btcContext = {
         price: btcRow.price,
         change5m: btcRow.change5m,
@@ -1164,11 +1614,17 @@ async function scan(): Promise<void> {
     rows.forEach((r, i) => detailRank.set(r.pair, i));
     for (const row of rows) {
       const known = knownWalls(row.pair);
-      const isStable =
-        STABLE_BASES.has(row.base) ||
-        PEGGED_BASES.has(row.base) ||
-        FIAT_BASES.has(row.base) ||
-        stablecoinLike(row.price, row.change15m, row.change24h);
+      // §2.1: exact-match junk list + pegged-price behaviour.
+      const isStable = isJunkBase(row.base) || stablecoinLike(row.price, row.change15m, row.change24h);
+      // §4: feed the persistence tracker every scan so wall age accrues; a
+      // known-null wall deletes the track (a vanished wall is a NEW wall when
+      // it returns).
+      const wallAgeSec = known.known ? trackWallAge(wallTracks, row.pair, known.ask) : null;
+      const walls = known.known ? (wallCache.get(row.pair) ?? null) : null;
+      // §4 futures positioning — one missed refresh must not flicker the filter
+      // to "no data", but 2×TTL-old data is honestly absent.
+      const fut = futuresCache.get(row.pair);
+      const futUsable = fut !== undefined && Date.now() - fut.at <= FUTURES_TTL_MS * 2 ? fut : null;
       const v2 = assessRow({
         base: row.base,
         price: row.price,
@@ -1189,6 +1645,25 @@ async function scan(): Promise<void> {
         btcChange15m: btcContext?.change15m ?? null,
         btcChange1h: btcContext?.change1h ?? null,
         isStablecoin: isStable,
+        // ── V2.1 feeds (§2.3/§3.4/§4/§2.5) ──
+        tradeSpike: row.tradeSpike,
+        closeStrength: row.closeStrength,
+        beta: row.beta ?? null,
+        residChange5m: row.residChange5m ?? null,
+        residChange15m: row.residChange15m ?? null,
+        btcChange5m: btcContext?.change5m ?? null,
+        btcAtr15m,
+        spreadBps: walls !== null ? walls.spreadBps : null,
+        wallAgeSec,
+        wallToDepthRatio: walls !== null ? walls.askWallToDepth : null,
+        askDepthToTp2Usd: walls !== null ? walls.askDepthUsd : null,
+        cvdSlope15m: row.cvdSlope15m ?? null,
+        avgTradeSizeSpike: row.avgTradeSizeSpike ?? null,
+        oiChange15m: futUsable !== null ? futUsable.oi : null,
+        fundingRatePct: futUsable !== null ? futUsable.funding : null,
+        lsRatio: futUsable !== null ? futUsable.ls : null,
+        listingAgeDays: listingAge.get(row.pair) ?? null,
+        historyBlocks: row.historyBlocks ?? null,
       });
       // Keep the payload sane: full checklists + scenarios for the top 20 and
       // subscribed pairs; scores + verdict + warnings for the long tail.
@@ -1316,6 +1791,7 @@ httpServer.listen(PORT, () => {
     void statsTaskLoop();
     void universeTaskLoop();
     void wallPumpLoop();
+    void futuresLoop();
     scheduleNext();
   })();
 });

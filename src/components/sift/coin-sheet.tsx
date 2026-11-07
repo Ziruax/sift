@@ -209,7 +209,24 @@ export function CoinSheet({
           <PositionTracker pair={pair} base={base || (coin?.symbol ?? "")} update={update} position={position} onSave={save} onLaunchBot={launchBot} />
 
           {/* V2 verdict — the seven filters, live for this pair */}
-          {update?.v2 && <V2Panel v2={update.v2} onLaunchBot={launchBotFromPlan} />}
+          {update?.v2 && (
+            <div className="space-y-2">
+              {update.v2.spreadBps != null && (
+                <p>
+                  <span
+                    className={cn(
+                      "num inline-flex items-center rounded-md border px-1.5 py-0.5 font-mono text-[10px] font-medium leading-none",
+                      update.v2.spreadBps > 15 ? "border-warn/40 text-warn" : "border-border text-muted-foreground",
+                    )}
+                    title="bid-ask spread in basis points — wider than 15 bps and the TP exit stops being honest"
+                  >
+                    spread {update.v2.spreadBps.toFixed(0)}bps
+                  </span>
+                </p>
+              )}
+              <V2Panel v2={update.v2} onLaunchBot={launchBotFromPlan} />
+            </div>
+          )}
 
           {/* Chart */}
           <PriceChart symbol={coin?.symbol ?? base ?? null} />

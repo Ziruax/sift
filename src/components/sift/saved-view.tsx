@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Star, X } from "lucide-react";
 import type { Coin } from "@/lib/market/types";
 import { formatCompact } from "@/lib/market/format";
+import { getSaved } from "@/lib/market/client";
 import { EmptyState, Pct, RowSkeleton } from "./primitives";
 
 export function SavedView({
@@ -17,14 +18,7 @@ export function SavedView({
 }) {
   const { data, isLoading, isError, error } = useQuery<Coin[]>({
     queryKey: ["saved", ids.join(",")],
-    queryFn: async () => {
-      const res = await fetch(`/api/saved?ids=${ids.map(encodeURIComponent).join(",")}`, { cache: "no-store" });
-      if (!res.ok) {
-        const body = (await res.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(body?.error ?? `Request failed (${res.status})`);
-      }
-      return res.json() as Promise<Coin[]>;
-    },
+    queryFn: () => getSaved(ids),
     enabled: ids.length > 0,
     refetchInterval: 60_000,
   });

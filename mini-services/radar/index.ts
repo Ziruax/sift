@@ -175,7 +175,7 @@ async function binanceFetch(path: string, timeoutMs = 10_000): Promise<unknown> 
 
 // ── Universe filtering (junk that never pumps) ───────────────────────────────
 
-const STABLE_BASES = new Set(["USDT", "USDC", "FDUSD", "DAI", "TUSD", "USDP", "BUSD"]);
+const STABLE_BASES = new Set(["USDT", "USDC", "FDUSD", "DAI", "TUSD", "USDP", "BUSD", "BFUSD", "USDS"]);
 const FIAT_BASES = new Set([
   "EUR", "GBP", "BRL", "AUD", "TRY", "NGN", "UAH", "ARS", "MXN", "ZAR", "PLN", "CZK", "HUF", "ILS",
 ]);

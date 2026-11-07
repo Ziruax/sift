@@ -1,10 +1,11 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { Search, Star, TrendingDown, TrendingUp } from "lucide-react";
+import { Gauge, Search, Star, TrendingDown, TrendingUp } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 import { changeOf, formatCompact, MOVER_HINT, MOVER_LABEL, moverSignalFor, WINDOW_LABEL } from "@/lib/market/format";
+import { getBoard, getFearGreed, searchCoins } from "@/lib/market/client";
 import type { Board, BookKey, Coin, WindowKey } from "@/lib/market/types";
 import { EmptyState, Pct, RowSkeleton, Stat } from "./primitives";
 
@@ -17,19 +18,10 @@ function useDebounced(value: string, delay: number) {
   return debounced;
 }
 
-async function fetchJson<T>(url: string): Promise<T> {
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) {
-    const body = (await res.json().catch(() => null)) as { error?: string } | null;
-    throw new Error(body?.error ?? `Request failed (${res.status})`);
-  }
-  return res.json() as Promise<T>;
-}
-
 function useBoard(window: WindowKey, book: BookKey) {
   return useQuery<Board>({
     queryKey: ["board", window, book],
-    queryFn: () => fetchJson<Board>(`/api/board?window=${window}&book=${book}`),
+    queryFn: () => getBoard({ window, book }),
     refetchInterval: 60_000,
   });
 }
@@ -37,10 +29,28 @@ function useBoard(window: WindowKey, book: BookKey) {
 function useSearch(q: string) {
   return useQuery<Coin[]>({
     queryKey: ["search", q],
-    queryFn: () => fetchJson<Coin[]>(`/api/search?q=${encodeURIComponent(q)}`),
+    queryFn: () => searchCoins(q),
     enabled: q.trim().length >= 1,
     staleTime: 60_000,
   });
+}
+
+function useFearGreed() {
+  return useQuery({
+    queryKey: ["fear-greed"],
+    queryFn: () => getFearGreed(),
+    staleTime: 5 * 60_000,
+    refetchInterval: 10 * 60_000,
+    retry: 1,
+  });
+}
+
+function fngTone(value: number): { dot: string; text: string } {
+  if (value >= 75) return { dot: "bg-up", text: "text-up" };
+  if (value >= 55) return { dot: "bg-up/70", text: "text-up" };
+  if (value > 45) return { dot: "bg-warn", text: "text-warn" };
+  if (value > 25) return { dot: "bg-down/70", text: "text-down" };
+  return { dot: "bg-down", text: "text-down" };
 }
 
 function CoinRow({
@@ -123,6 +133,7 @@ export function MarketsView({
 
   const board = useBoard(window, book);
   const search = useSearch(debounced.trim().toLowerCase());
+  const fng = useFearGreed();
   const showSearch = focused && query.trim().length >= 1;
 
   useEffect(() => {
@@ -138,11 +149,41 @@ export function MarketsView({
   return (
     <div className="space-y-5">
       {/* Global stats */}
-      <section aria-label="Global market stats" className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+      <section aria-label="Global market stats" className="grid grid-cols-2 gap-3 sm:grid-cols-4 xl:grid-cols-5">
         <Stat label="Market cap" value={g ? formatCompact(g.marketCap) : "—"} change={g?.marketCapChange24h} />
         <Stat label="24h volume" value={g ? formatCompact(g.volume24h) : "—"} change={g?.volumeChange24h} />
         <Stat label="BTC dominance" value={g ? `${g.btcDominance.toFixed(1)}%` : "—"} />
         <Stat label="Tracked coins" value={g ? g.listed.toLocaleString() : "—"} />
+        {/* Fear & Greed sentiment — alternative.me free feed */}
+        <div className="rounded-xl border border-border bg-card px-4 py-3 sm:col-span-2 xl:col-span-1" title="Crypto Fear & Greed Index from alternative.me — daily survey of volatility, momentum, social media, dominance and trends">
+          <p className="flex items-center gap-1.5 text-[11px] uppercase tracking-widest text-muted-foreground">
+            <Gauge className="size-3.5" aria-hidden="true" />
+            Fear &amp; Greed
+          </p>
+          {fng.data ? (
+            <>
+              <p className="num mt-1 flex items-baseline gap-2 font-mono text-xl font-semibold leading-none">
+                <span className={cn("inline-block size-2 rounded-full", fngTone(fng.data.today.value).dot)} aria-hidden="true" />
+                <span className={fngTone(fng.data.today.value).text}>{fng.data.today.value}</span>
+                <span className={cn("text-xs font-medium", fngTone(fng.data.today.value).text)}>{fng.data.today.label}</span>
+              </p>
+              <div className="mt-2 flex items-end gap-0.5" aria-hidden="true">
+                {fng.data.history.slice(0, 14).reverse().map((d) => (
+                  <span
+                    key={d.at}
+                    className={cn(
+                      "w-full min-w-0 rounded-[2px]",
+                      d.value >= 55 ? "bg-up/60" : d.value > 45 ? "bg-warn/60" : "bg-down/60",
+                    )}
+                    style={{ height: `${Math.max(3, (d.value / 100) * 18)}px` }}
+                  />
+                ))}
+              </div>
+            </>
+          ) : (
+            <p className="mt-1 font-mono text-xl font-semibold leading-none text-muted-foreground">—</p>
+          )}
+        </div>
       </section>
 
       {/* Search */}
@@ -321,7 +362,7 @@ export function MarketsView({
           </div>
         )}
         <p className="border-t border-border px-4 py-2 text-[11px] text-muted-foreground">
-          {board.data ? `Updated ${new Date(board.data.updatedAt).toLocaleTimeString([], { hour12: false })} · CoinPaprika feed` : ""}
+          {board.data ? `Updated ${new Date(board.data.updatedAt).toLocaleTimeString([], { hour12: false })} · CoinPaprika feed, straight from your browser` : ""}
         </p>
       </section>
     </div>

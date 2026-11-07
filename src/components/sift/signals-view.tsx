@@ -2,24 +2,59 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { Award, Clock, Flame, Target } from "lucide-react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { cn } from "@/lib/utils";
 import { SIGNAL_META, SIGNAL_ORDER } from "@/lib/market/format";
-import type { MarketSignal, SignalType, SignalsResponse } from "@/lib/market/types";
+import { useLocalSignals } from "@/hooks/use-radar-socket";
+import type { MarketSignal, SignalType, SignalTypeStat, SignalsResponse } from "@/lib/market/types";
 import { EmptyState, Pct, RowSkeleton, ScorePill, SignalTypeChip } from "./primitives";
 
-async function fetchSignals(type: string | null): Promise<SignalsResponse> {
+async function fetchSignals(type: string | null): Promise<SignalsResponse & { serverDown?: boolean }> {
   const url = type ? `/api/signals?type=${type}` : "/api/signals";
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) {
-    const body = (await res.json().catch(() => null)) as { error?: string } | null;
-    throw new Error(body?.error ?? `Request failed (${res.status})`);
+  try {
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => null)) as { error?: string } | null;
+      throw new Error(body?.error ?? `Request failed (${res.status})`);
+    }
+    return (await res.json()) as SignalsResponse;
+  } catch {
+    // No server log reachable (e.g. static deployment) — the browser
+    // engine's own log is the full log.
+    return { signals: [], stats: [], total: 0, serverDown: true };
   }
-  return res.json() as Promise<SignalsResponse>;
+}
+
+/** Stats computed over whatever log we have — same formulas as the server. */
+function computeStats(signals: MarketSignal[]): SignalTypeStat[] {
+  return SIGNAL_ORDER.map((type) => {
+    const rows = signals.filter((s) => s.type === type);
+    const finals = rows.filter((s) => s.status === "final" && s.change60m !== null);
+    const wins = finals.filter((s) => {
+      const g = (s.change60m ?? 0) * (s.direction === "long" ? 1 : -1);
+      return g > 0;
+    });
+    const avg = (pick: (s: MarketSignal) => number | null) => {
+      const values = rows.map(pick).filter((v): v is number => v !== null && Number.isFinite(v));
+      return values.length > 0 ? values.reduce((a, b) => a + b, 0) / values.length : null;
+    };
+    return {
+      type,
+      count: rows.length,
+      finals: finals.length,
+      wins: wins.length,
+      winRate: finals.length > 0 ? wins.length / finals.length : null,
+      avgChange5m: avg((s) => s.change5m),
+      avgChange15m: avg((s) => s.change15m),
+      avgChange60m: avg((s) => s.change60m),
+      avgMfe: avg((s) => s.mfe),
+      avgMae: avg((s) => s.mae),
+    };
+  });
 }
 
 function useSignals(type: string | null, refreshKey: number) {
-  return useQuery<SignalsResponse>({
+  return useQuery<SignalsResponse & { serverDown?: boolean }>({
     queryKey: ["signals", type, refreshKey],
     queryFn: () => fetchSignals(type),
     refetchInterval: 30_000,
@@ -33,7 +68,20 @@ function graded(change: number | null, direction: "long" | "short"): number | nu
 
 export function SignalsView({ refreshKey, onOpenPair }: { refreshKey: number; onOpenPair: (pair: string) => void }) {
   const [type, setType] = useState<SignalType | "all">("all");
-  const { data, isLoading, isError, error } = useSignals(type === "all" ? null : type, refreshKey);
+  const { data, isLoading } = useSignals(type === "all" ? null : type, refreshKey);
+  const localSignals = useLocalSignals();
+
+  // One log: the server scanner's history plus the in-browser engine's
+  // signals, deduped by id, newest first.
+  const merged = useMemo(() => {
+    const byId = new Map<string, MarketSignal>();
+    for (const s of localSignals) byId.set(s.id, s);
+    for (const s of data?.signals ?? []) if (!byId.has(s.id)) byId.set(s.id, s);
+    return [...byId.values()].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  }, [localSignals, data]);
+
+  const stats = useMemo(() => computeStats(merged), [merged]);
+  const statFor = (t: SignalType) => stats.find((s) => s.type === t);
 
   return (
     <div className="space-y-4">
@@ -53,7 +101,7 @@ export function SignalsView({ refreshKey, onOpenPair }: { refreshKey: number; on
       {/* Per-type stats */}
       <section aria-label="Signal performance" className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
         {SIGNAL_ORDER.map((t) => {
-          const stat = data?.stats.find((s) => s.type === t);
+          const stat = statFor(t);
           const meta = SIGNAL_META[t];
           return (
             <div
@@ -123,18 +171,26 @@ export function SignalsView({ refreshKey, onOpenPair }: { refreshKey: number; on
         <div className="flex items-center gap-2 border-b border-border px-4 py-2.5">
           <Clock className="size-4 text-muted-foreground" aria-hidden="true" />
           <h3 className="text-sm font-semibold">Opportunity log</h3>
-          {data && <span className="num rounded-full bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">{data.total} total</span>}
+          {merged.length > 0 && (
+            <span className="num rounded-full bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">{merged.length} shown</span>
+          )}
+          {data?.serverDown && (
+            <span
+              className="rounded-md border border-warn/30 px-1.5 py-0.5 text-[10px] text-warn"
+              title="The server signal log is unreachable — showing this browser's engine log"
+            >
+              browser log
+            </span>
+          )}
         </div>
 
         {isLoading ? (
           <div className="p-4"><RowSkeleton rows={8} /></div>
-        ) : isError ? (
-          <div className="p-4"><EmptyState title="Signal log unavailable" body={error.message} /></div>
-        ) : !data || data.signals.length === 0 ? (
+        ) : merged.length === 0 ? (
           <div className="p-4">
             <EmptyState
               title="No signals recorded yet"
-              body="The scanner has been quiet — either the market is flat or the service just started. Signals appear here the moment the tape changes character."
+              body="The scanner has been quiet — either the market is flat or the engine just started. Signals appear here the moment the tape changes character; the in-browser engine needs about a minute of warm-up after a fresh load."
             />
           </div>
         ) : (
@@ -156,7 +212,7 @@ export function SignalsView({ refreshKey, onOpenPair }: { refreshKey: number; on
                 </tr>
               </thead>
               <tbody>
-                {data.signals.map((s: MarketSignal) => {
+                {merged.map((s: MarketSignal) => {
                   const g5 = graded(s.change5m, s.direction);
                   const g15 = graded(s.change15m, s.direction);
                   const g60 = graded(s.change60m, s.direction);

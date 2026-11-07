@@ -1,11 +1,24 @@
 "use client";
 
-import { AlertTriangle, ArrowDown, ArrowUp, DollarSign, TrendingDown, TrendingUp } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowUp, Bot, DollarSign, TrendingDown, TrendingUp } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { formatCompact, formatPrice } from "@/lib/market/format";
 import type { PairUpdate } from "@/lib/market/types";
 import type { TrackedPosition } from "@/lib/watchlist";
 import { BuyBar, EmptyState, LivePrice, Pct, ScorePill, SpikeMeter } from "./primitives";
+
+export type BotLaunchPrefill = {
+  pair: string;
+  base: string;
+  investment: number;
+  entry: number;
+  direction: "long" | "short";
+  targetLow: number;
+  targetHigh: number;
+  stopLow: number;
+  stopHigh: number;
+  note: string;
+};
 
 function NumberField({
   label,
@@ -50,12 +63,14 @@ export function PositionTracker({
   update,
   position,
   onSave,
+  onLaunchBot,
 }: {
   pair: string | null;
   base: string;
   update: PairUpdate | null;
   position: TrackedPosition | null;
   onSave: (p: TrackedPosition) => void;
+  onLaunchBot?: (prefill: BotLaunchPrefill) => void;
 }) {
   if (!pair) {
     return (
@@ -89,6 +104,28 @@ export function PositionTracker({
       entry: price,
       takeProfit: Number((price * (isLong ? 1.08 : 0.92)).toPrecision(6)),
       stopLoss: Number((price * (isLong ? 0.96 : 1.04)).toPrecision(6)),
+    });
+  };
+
+  // One tap turns this position into an armed bot with the same ranges —
+  // the investment and TP/SL above become its target/stop zones.
+  const launchBot = () => {
+    if (!pair || price <= 0 || !onLaunchBot) return;
+    const isLong = position.direction === "long";
+    const entry = position.entry > 0 ? position.entry : price;
+    const tp = position.takeProfit > 0 ? position.takeProfit : Number((price * (isLong ? 1.08 : 0.92)).toPrecision(6));
+    const sl = position.stopLoss > 0 ? position.stopLoss : Number((price * (isLong ? 0.96 : 1.04)).toPrecision(6));
+    onLaunchBot({
+      pair,
+      base: base || pair.replace(/USDT$/, ""),
+      investment: position.investment > 0 ? position.investment : 10,
+      entry,
+      direction: position.direction,
+      targetLow: Number((tp * (isLong ? 0.99 : 1.01)).toPrecision(6)),
+      targetHigh: Number((tp * (isLong ? 1.01 : 0.99)).toPrecision(6)),
+      stopLow: Number((sl * (isLong ? 0.99 : 1.01)).toPrecision(6)),
+      stopHigh: Number((sl * (isLong ? 1.01 : 0.99)).toPrecision(6)),
+      note: `From ${base || pair.replace(/USDT$/, "")} position tracker`,
     });
   };
 
@@ -148,15 +185,29 @@ export function PositionTracker({
           <TrendingUp className="size-4 text-up" aria-hidden="true" />
           Track a position — {base}/USDT
         </h3>
-        <button
-          type="button"
-          onClick={fillFromLive}
-          disabled={price <= 0}
-          className="flex min-h-9 items-center gap-1.5 rounded-lg bg-primary px-3 text-xs font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40"
-        >
-          <DollarSign className="size-3.5" aria-hidden="true" />
-          I entered now
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={fillFromLive}
+            disabled={price <= 0}
+            className="flex min-h-9 items-center gap-1.5 rounded-lg bg-primary px-3 text-xs font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40"
+          >
+            <DollarSign className="size-3.5" aria-hidden="true" />
+            I entered now
+          </button>
+          {onLaunchBot && (
+            <button
+              type="button"
+              onClick={launchBot}
+              disabled={price <= 0}
+              title="Arm an investment bot that pings you the moment price enters your take-profit or stop range"
+              className="flex min-h-9 items-center gap-1.5 rounded-lg border border-up/40 bg-up-soft px-3 text-xs font-semibold text-up transition-opacity hover:opacity-90 disabled:opacity-40"
+            >
+              <Bot className="size-3.5" aria-hidden="true" />
+              Arm bot
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Fields */}

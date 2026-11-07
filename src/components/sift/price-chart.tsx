@@ -5,6 +5,7 @@ import { useState } from "react";
 import { Area, AreaChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { cn } from "@/lib/utils";
 import { downsample, RANGE_LABEL } from "@/lib/market/format";
+import { getHistory } from "@/lib/market/client";
 import type { HistoryResult, PricePoint, RangeKey } from "@/lib/market/types";
 
 const RANGES: RangeKey[] = ["1d", "7d", "1m", "3m", "1y", "max"];
@@ -12,18 +13,10 @@ const RANGES: RangeKey[] = ["1d", "7d", "1m", "3m", "1y", "max"];
 function useHistory(symbol: string | null, range: RangeKey) {
   return useQuery<HistoryResult>({
     queryKey: ["history", symbol, range],
-    queryFn: async () => {
-      const res = await fetch(`/api/history?symbol=${encodeURIComponent(symbol ?? "")}&range=${range}`, { cache: "no-store" });
-      if (!res.ok) {
-        const body = (await res.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(body?.error ?? `Request failed (${res.status})`);
-      }
-      return res.json() as Promise<HistoryResult>;
-    },
+    queryFn: () => getHistory({ symbol: symbol ?? "", range }),
     enabled: symbol !== null,
     staleTime: range === "1d" || range === "7d" ? 60_000 : 300_000,
   });
-
 }
 
 function fmtAxis(range: RangeKey, t: number): string {
@@ -129,7 +122,7 @@ export function PriceChart({ symbol }: { symbol: string | null }) {
       </div>
       {data && chart.length >= 2 && (
         <p className="border-t border-border px-4 py-1.5 text-[10px] text-muted-foreground">
-          {points.length.toLocaleString()} candles from {data.source === "binance" ? "Binance spot klines" : data.source === "llama" ? "DeFiLlama" : "Yahoo Finance"}
+          {points.length.toLocaleString()} candles from {data.source === "binance" ? "Binance spot klines" : data.source === "llama" ? "DeFiLlama" : "the fallback feed"}
         </p>
       )}
     </div>

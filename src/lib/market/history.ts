@@ -91,7 +91,7 @@ async function llamaChunk(slug: string, start: number, period: string, span: num
 async function llamaHistory(slug: string, range: RangeKey): Promise<PricePoint[]> {
   if (!slug) return [];
   const now = Math.floor(Date.now() / 1000);
-  if (range !== "max" && range !== "5y" && range !== "1y") {
+  if (range !== "max" && range !== "1y") {
     const spec =
       range === "1d"
         ? { period: "5m", span: 288, start: now - 86_400 }

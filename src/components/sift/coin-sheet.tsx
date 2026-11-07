@@ -2,34 +2,20 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { ExternalLink, Star } from "lucide-react";
+import { useCallback } from "react";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { cn } from "@/lib/utils";
 import { formatCompact, formatDay, formatSupply, formatPrice, pairForSymbol } from "@/lib/market/format";
+import { getCoin, lookupByPair } from "@/lib/market/client";
 import type { CoinDetail, MarketSignal, SignalsResponse } from "@/lib/market/types";
 import { usePosition } from "@/lib/watchlist";
-import { usePairStream } from "@/hooks/use-radar-socket";
+import { queueBotPrefill } from "@/lib/bots";
+import { useLocalSignals, usePairStream } from "@/hooks/use-radar-socket";
 import { PriceChart } from "./price-chart";
-import { PositionTracker } from "./position-tracker";
+import { PositionTracker, type BotLaunchPrefill } from "./position-tracker";
 import { Pct, SignalTypeChip } from "./primitives";
 
 export type CoinTarget = { kind: "id"; id: string } | { kind: "pair"; pair: string } | null;
-
-async function fetchDetail(id: string): Promise<CoinDetail> {
-  const res = await fetch(`/api/coin/${encodeURIComponent(id)}`, { cache: "no-store" });
-  if (!res.ok) {
-    const body = (await res.json().catch(() => null)) as { error?: string } | null;
-    throw new Error(body?.error ?? `Request failed (${res.status})`);
-  }
-  return res.json() as Promise<CoinDetail>;
-}
-
-// Resolve a Binance pair to the matching CoinPaprika coin (best-effort).
-async function fetchLookup(pair: string): Promise<CoinDetail | null> {
-  const res = await fetch(`/api/coin/lookup?pair=${encodeURIComponent(pair)}`, { cache: "no-store" });
-  if (!res.ok) return null;
-  const body = (await res.json()) as { found: boolean; detail: CoinDetail | null };
-  return body.detail ?? null;
-}
 
 function useCoinDetail(target: CoinTarget) {
   const idKey = target?.kind === "id" ? target.id : null;
@@ -37,16 +23,18 @@ function useCoinDetail(target: CoinTarget) {
 
   const byId = useQuery<CoinDetail>({
     queryKey: ["coin", idKey],
-    queryFn: () => fetchDetail(idKey as string),
+    queryFn: () => getCoin(idKey as string),
     enabled: idKey !== null,
     staleTime: 60_000,
+    retry: 1,
   });
 
   const byPair = useQuery<CoinDetail | null>({
     queryKey: ["lookup", pairKey],
-    queryFn: () => fetchLookup(pairKey as string),
+    queryFn: () => lookupByPair(pairKey as string),
     enabled: pairKey !== null && !byId.data,
     staleTime: 300_000,
+    retry: 1,
   });
 
   if (idKey !== null) return byId;
@@ -73,6 +61,7 @@ export function CoinSheet({
   unsubscribe,
   isStarred,
   onToggleStar,
+  onNavigate,
 }: {
   target: CoinTarget;
   onClose: () => void;
@@ -80,6 +69,7 @@ export function CoinSheet({
   unsubscribe: (pair: string) => void;
   isStarred: (id: string) => boolean;
   onToggleStar: (id: string) => void;
+  onNavigate: (tab: "bots") => void;
 }) {
   const detail = useCoinDetail(target);
   const coin = detail.data?.coin ?? null;
@@ -87,20 +77,46 @@ export function CoinSheet({
   const base = pair ? pair.replace(/USDT$/, "") : "";
   const update = usePairStream(pair, subscribe, unsubscribe);
   const { position, save } = usePosition(pair);
+  const localSignals = useLocalSignals();
 
   const signals = useQuery<MarketSignal[]>({
     queryKey: ["pair-signals", pair],
     queryFn: async () => {
-      const res = await fetch(`/api/signals?pair=${encodeURIComponent(pair ?? "")}&limit=8`, { cache: "no-store" });
-      if (!res.ok) return [];
-      const body = (await res.json()) as SignalsResponse;
-      return body.signals;
+      // Server log first (works where the backend lives); the browser
+      // engine's log fills in whenever the server is unreachable.
+      try {
+        const res = await fetch(`/api/signals?pair=${encodeURIComponent(pair ?? "")}&limit=8`, { cache: "no-store" });
+        if (!res.ok) return [];
+        const body = (await res.json()) as SignalsResponse;
+        return body.signals;
+      } catch {
+        return [];
+      }
     },
     enabled: pair !== null,
     refetchInterval: 30_000,
   });
 
+  // Merge server + local-engine signals for this pair, newest first.
+  const mergedSignals = pair
+    ? [...localSignals.filter((s) => s.pair === pair), ...(signals.data ?? []).filter((s) => !localSignals.some((l) => l.id === s.id))]
+        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+        .slice(0, 8)
+    : [];
+
   const open = target !== null;
+
+  // Hand the position to the Bots tab: queue the prefill (the form may not
+  // be mounted yet), dispatch the event for the already-mounted case, then
+  // navigate there.
+  const launchBot = useCallback(
+    (prefill: BotLaunchPrefill) => {
+      queueBotPrefill(prefill);
+      window.dispatchEvent(new CustomEvent("sift:prefill-bot", { detail: prefill }));
+      onNavigate("bots");
+    },
+    [onNavigate],
+  );
 
   return (
     <Sheet open={open} onOpenChange={(v) => !v && onClose()}>
@@ -168,8 +184,8 @@ export function CoinSheet({
         </SheetHeader>
 
         <div className="flex-1 space-y-4 px-5 py-4">
-          {/* Live tracker */}
-          <PositionTracker pair={pair} base={base || (coin?.symbol ?? "")} update={update} position={position} onSave={save} />
+            {/* Live tracker */}
+          <PositionTracker pair={pair} base={base || (coin?.symbol ?? "")} update={update} position={position} onSave={save} onLaunchBot={launchBot} />
 
           {/* Chart */}
           <PriceChart symbol={coin?.symbol ?? base ?? null} />
@@ -180,9 +196,9 @@ export function CoinSheet({
               <h3 className="text-sm font-semibold">Recent radar signals</h3>
               {signals.isLoading ? (
                 <div className="mt-2 h-16 animate-pulse rounded-lg bg-muted" />
-              ) : signals.data && signals.data.length > 0 ? (
+              ) : mergedSignals.length > 0 ? (
                 <ul className="mt-2 divide-y divide-border/60">
-                  {signals.data.map((s) => (
+                  {mergedSignals.map((s) => (
                     <li key={s.id} className="flex items-center justify-between gap-2 py-2 text-xs">
                       <span className="flex items-center gap-2">
                         <SignalTypeChip type={s.type} compact />

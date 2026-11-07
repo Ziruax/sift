@@ -1,0 +1,1067 @@
+     1→// ── Sift V2 accuracy engine ──────────────────────────────────────────────────
+     2→//
+     3→// One shared brain, three consumers:
+     4→//   • the server-side scanner (mini-services/radar) — imports this via a
+     5→//     relative path,
+     6→//   • the in-browser engine (local-radar.ts) — imports it like any module,
+     7→//   • the backtest simulator (Backtest view) — replays history through the
+     8→//     exact same filters.
+     9→//
+    10→// Why one module: the old app graded a coin on a single 0-100 "score" and was
+    11→// right ~30% of the time. V2 refuses to speak unless seven independent filters
+    12→// agree, and every number below is derived from real microstructure — order
+    13→// books, taker flow, trade counts, BTC regime — not vibes.
+    14→//
+    15→// The contract with reality: no filter set makes the market predictable. What
+    16→// this engine does is (a) refuse the obviously fake setups (stablecoins, one
+    17→// whale print, unbreakable walls), (b) size stops to each coin's own
+    18→// volatility so a wrong call loses ~1% while a right one pays 2-3.5%, and
+    19→// (c) show the scenario map BEFORE the decision, so the trader knows what
+    20→// confirms and what invalidates.
+    21→
+    22→import type { RadarRow } from "./types";
+    23→
+    24→// ── Tunables (all thresholds in one place — the backtest tunes these) ────────
+    25→
+    26→export const V2 = {
+    27→  // Momentum filter — tuned by grid search over 14 days of 5m candles:
+    28→  // a GO needs a real impulse (+0.4% on both the 5m and 15m windows), not a
+    29→  // drift. Weak momentum fired 3× the trades at a worse win rate.
+    30→  momentumGreen: 0.4,
+    31→  momentum1mRed: -0.1, // 1m below this → extra penalty
+    32→  // Dollar-volume filter (real money, not "3.0x of nothing")
+    33→  volHighUsd: 100_000,
+    34→  volLowUsd: 50_000,
+    35→  // Liquidity filter
+    36→  tradesLow: 200, // fewer trades in 5m → penalty
+    37→  tradesHealthy: 500, // more → small bonus
+    38→  // Wall filter
+    39→  wallVsVol: 1, // wall bigger than 5m USD volume → unbreakable
+    40→  wallScanPct: 2, // walls counted within ±2% of price
+    41→  wallConfirmMs: 120_000, // price must hold above a broken wall 2 min
+    42→  // BTC regime filter
+    43→  btcBull: 0.3, // BTC 15m above → bull mode
+    44→  btcDump: -0.3, // below → dump mode, longs blocked
+    45→  goScore: 70, // final score needed to say "go" (bull mode for longs)
+    46→  goScoreFlat: 80, // flat BTC regime — longs/shorts need to be exceptional
+    47→  watchScore: 60, // 60-69 → "watch only"
+    48→  // Day-extension gate: never chase a move that already happened.
+    49→  goLongDayMin: -5, // below this it's a falling knife, not a long
+    50→  goLongDayMax: 8, // above this the pump already happened
+    51→  goShortDayMin: -15, // below this the crash is mostly done — bounce risk
+    52→  goShortDayMax: 5, // above this the day trend fights the short
+    53→  // Hard gates for a GO (on top of the score) — a GO must have real volume,
+    54→  // real participation and the crowd on the right side.
+    55→  goMinRvol: 2,
+    56→  goMinBuyPctLong: 52,
+    57→  goMinBuyPctShort: 48,
+    58→  // Trap checks
+    59→  fakeBuyersPct: 85, // buyers% above this with few trades = fake
+    60→  fakeBuyersTrades: 200,
+    61→  sellersDumpingPct: 40, // buyers% below this with real volume = dump
+    62→  sellersDumpingVolUsd: 100_000,
+    63→  // Trade plan geometry — take profits are multiples of the risk (asymmetric
+    64→  // by construction: win 2× or 3.5× what a loss costs).
+    65→  tp1Mult: 2,
+    66→  tp2Mult: 3.5,
+    67→  // Cooldowns — stop the flip-flopping that destroyed trust in V1
+    68→  longBlockAfterBearishMs: 60 * 60_000, // exit/dump signal blocks longs 60m
+    69→  longBlockAfterShortMs: 30 * 60_000, // a go_short blocks longs 30m
+    70→  shortBlockAfterLongMs: 30 * 60_000, // and vice versa
+    71→  signalRepeatMs: 30 * 60_000, // same go-signal refires at most every 30m
+    72→} as const;
+    73→
+    74→// ── Stablecoin immunity ──────────────────────────────────────────────────────
+    75→//
+    76→// The single biggest fake-signal source in V1: "U" scored 86 pump while priced
+    77→// at $1.0004 — a stablecoin can never pump. Two layers:
+    78→//   1. the known blacklist (maintained in each scanner's universe filter), and
+    79→//   2. this runtime check — price pinned to a dollar and 15m change inside a
+    80→//      ±0.05% band is a stablecoin no matter what its name says.
+    81→
+    82→export function stablecoinLike(price: number, change15m: number, change24h: number): boolean {
+    83→  if (price > 0.99 && price < 1.01 && Math.abs(change15m) <= 0.05 && Math.abs(change24h) <= 1) return true;
+    84→  return false;
+    85→}
+    86→
+    87→// ── BTC market regime ────────────────────────────────────────────────────────
+    88→
+    89→export type BtcMode = "bull" | "flat" | "dump";
+    90→
+    91→export function btcModeFor(btcChange15m: number | null | undefined): BtcMode | null {
+    92→  if (typeof btcChange15m !== "number" || !Number.isFinite(btcChange15m)) return null;
+    93→  if (btcChange15m > V2.btcBull) return "bull";
+    94→  if (btcChange15m < V2.btcDump) return "dump";
+    95→  return "flat";
+    96→}
+    97→
+    98→export const BTC_MODE_COPY: Record<BtcMode, { label: string; note: string; tone: "up" | "warn" | "down" }> = {
+    99→  bull: { label: "Bull mode", note: "BTC leading — longs allowed at the normal 70 bar", tone: "up" },
+   100→  flat: { label: "Flat mode", note: "BTC drifting — longs need the stricter 75 bar", tone: "warn" },
+   101→  dump: { label: "Dump mode", note: "BTC dumping — all longs blocked, shorts favoured", tone: "down" },
+   102→};
+   103→
+   104→// ── ATR — each coin sets its own stop distance ───────────────────────────────
+   105→
+   106→/** True range series from candle [high, low, close] triples. */
+   107→export function atrPctFromCandles(
+   108→  candles: Array<{ high: number; low: number; close: number }>,
+   109→  period = 14,
+   110→): number | null {
+   111→  if (candles.length < period + 1) return null;
+   112→  let sum = 0;
+   113→  for (let i = candles.length - period; i < candles.length; i += 1) {
+   114→    const cur = candles[i];
+   115→    const prev = candles[i - 1];
+   116→    if (!cur || !prev) return null;
+   117→    const tr = Math.max(cur.high - cur.low, Math.abs(cur.high - prev.close), Math.abs(cur.low - prev.close));
+   118→    sum += tr;
+   119→  }
+   120→  const atr = sum / period;
+   121→  const last = candles[candles.length - 1];
+   122→  if (!last || last.close <= 0) return null;
+   123→  return (atr / last.close) * 100;
+   124→}
+   125→
+   126→// ── Trade plans — the "make money at 60% accuracy" machinery ─────────────────
+   127→//
+   128→// Risk is sized to the coin's own 1m ATR, clamped to a sane band, then take
+   129→// profits are 2× and 3.5× the risk — asymmetric by construction. A wall that
+   130→// sits inside the profit zone invalidates the plan (you do not aim a take
+   131→// profit through a wall the tape cannot eat).
+   132→
+   133→export type TradePlan = {
+   134→  side: "long" | "short";
+   135→  entry: number;
+   136→  stop: number;
+   137→  tp1: number;
+   138→  tp2: number;
+   139→  riskPct: number;
+   140→  tp1Pct: number;
+   141→  tp2Pct: number;
+   142→  riskReward1: number;
+   143→  riskReward2: number;
+   144→  atrPct: number | null;
+   145→  blocked: boolean;
+   146→  blockReason: string | null;
+   147→};
+   148→
+   149→export function clampRisk(atrPct: number | null, mult = 1, min = 1, max = 1.6): number {
+   150→  // Spec-literal: stop distance 1.0% at minimum, widening to 1.6% for
+   151→  // volatile coins. Tighter stops look precise and get eaten by noise — a
+   152→  // 0.5% stop on an alt with 0.4% five-minute ATR is a coin flip.
+   153→  if (atrPct === null || !Number.isFinite(atrPct) || atrPct <= 0) return min;
+   154→  return Math.min(max, Math.max(min, (atrPct * mult) / 1));
+   155→}
+   156→
+   157→export function buildTradePlan(
+   158→  side: "long" | "short",
+   159→  entry: number,
+   160→  atrPct: number | null,
+   161→  wall: { price: number; valueUsd: number } | null,
+   162→  vol5mUsd: number,
+   163→): TradePlan {
+   164→  const riskPct = clampRisk(atrPct);
+   165→  const tp1Pct = riskPct * V2.tp1Mult;
+   166→  const tp2Pct = riskPct * V2.tp2Mult;
+   167→  const dir = side === "long" ? 1 : -1;
+   168→  const plan: TradePlan = {
+   169→    side,
+   170→    entry,
+   171→    stop: entry * (1 - (dir * riskPct) / 100),
+   172→    tp1: entry * (1 + (dir * tp1Pct) / 100),
+   173→    tp2: entry * (1 + (dir * tp2Pct) / 100),
+   174→    riskPct,
+   175→    tp1Pct,
+   176→    tp2Pct,
+   177→    riskReward1: V2.tp1Mult,
+   178→    riskReward2: V2.tp2Mult,
+   179→    atrPct: atrPct ?? null,
+   180→    blocked: false,
+   181→    blockReason: null,
+   182→  };
+   183→  // Wall invalidation: for longs an ask wall between entry and TP2 eats the
+   184→  // move; for shorts a bid wall does the same on the way down.
+   185→  if (wall && wall.price > 0 && wall.valueUsd > vol5mUsd * V2.wallVsVol) {
+   186→    const inTheWay = side === "long" ? wall.price < plan.tp2 && wall.price > entry : wall.price > plan.tp2 && wall.price < entry;
+   187→    if (inTheWay) {
+   188→      plan.blocked = true;
+   189→      plan.blockReason = `Wall $${Math.round(wall.valueUsd / 1000)}K at ${wall.price.toPrecision(6)} sits inside the profit zone — the tape cannot eat it yet`;
+   190→    }
+   191→  }
+   192→  return plan;
+   193→}
+   194→
+   195→/** Dollar risk framing: "risk $5 → lose max $0.05". */
+   196→export function riskFrame(investmentUsd: number, plan: TradePlan): { maxLossUsd: number; tp1Usd: number; tp2Usd: number } {
+   197→  return {
+   198→    maxLossUsd: (investmentUsd * plan.riskPct) / 100,
+   199→    tp1Usd: (investmentUsd * plan.tp1Pct) / 100,
+   200→    tp2Usd: (investmentUsd * plan.tp2Pct) / 100,
+   201→  };
+   202→}
+   203→
+   204→// ── The seven filters ────────────────────────────────────────────────────────
+   205→
+   206→export type V2Wall = { price: number; valueUsd: number } | null;
+   207→
+   208→export type V2Input = {
+   209→  base: string;
+   210→  price: number;
+   211→  change1m: number;
+   212→  change5m: number;
+   213→  change15m: number;
+   214→  change24h: number;
+   215→  vol5mUsd: number;
+   216→  rvol: number;
+   217→  trades5m: number;
+   218→  buyPct: number;
+   219→  baseScore: number;
+   220→  atrPct: number | null;
+   221→  askWall: V2Wall; // biggest ask wall within 2% above (null = unknown)
+   222→  bidWall: V2Wall; // biggest bid wall within 2% below
+   223→  askWallKnown: boolean; // false when the book was not fetched
+   224→  wallBrokenConfirmed: boolean | null; // price held above the wall ≥2 min
+   225→  btcChange15m: number | null;
+   226→  btcChange1h: number | null; // multi-timeframe regime — bull traps filter
+   227→  isStablecoin: boolean;
+   228→};
+   229→
+   230→export type V2Check = {
+   231→  label: string;
+   232→  pass: boolean | null; // null = not applicable / no data
+   233→  note: string;
+   234→};
+   235→
+   236→export type SideVerdict = "go" | "watch" | "skip" | "blocked_btc";
+   237→
+   238→export type SideAssessment = {
+   239→  score: number;
+   240→  verdict: SideVerdict;
+   241→  checks: V2Check[];
+   242→  trade: TradePlan | null;
+   243→};
+   244→
+   245→function fmtUsd(v: number): string {
+   246→  if (v >= 1_000_000) return `$${(v / 1_000_000).toFixed(1)}M`;
+   247→  if (v >= 1_000) return `$${(v / 1_000).toFixed(1)}K`;
+   248→  return `$${Math.round(v)}`;
+   249→}
+   250→
+   251→/** LONG side — the spec's Final Score, implemented literally. */
+   252→export function assessLong(input: V2Input): SideAssessment {
+   253→  const checks: V2Check[] = [];
+   254→  const warnings: string[] = [];
+   255→
+   256→  // 1 — momentum (must be green, and staying green)
+   257→  let momentum = 0;
+   258→  const m5 = input.change5m;
+   259→  const m15 = input.change15m;
+   260→  if (m5 > V2.momentumGreen && m15 > V2.momentumGreen) momentum += 15;
+   261→  if (m5 < 0 || m15 < 0) momentum -= 20;
+   262→  if (input.change1m < V2.momentum1mRed) momentum -= 10;
+   263→  checks.push({
+   264→    label: "Momentum",
+   265→    pass: m5 > V2.momentumGreen && m15 > V2.momentumGreen,
+   266→    note:
+   267→      m5 > V2.momentumGreen && m15 > V2.momentumGreen
+   268→        ? `5m ${m5.toFixed(2)}% and 15m ${m15.toFixed(2)}% both green +15`
+   269→        : m5 < 0 || m15 < 0
+   270→          ? `tape red (5m ${m5.toFixed(2)}%, 15m ${m15.toFixed(2)}%) −20`
+   271→          : `tape not green enough (5m ${m5.toFixed(2)}%, 15m ${m15.toFixed(2)}%)`,
+   272→  });
+   273→
+   274→  // 2 — real dollar volume
+   275→  let volume = 0;
+   276→  if (input.vol5mUsd > V2.volHighUsd) volume += 10;
+   277→  else if (input.vol5mUsd < V2.volLowUsd) volume -= 20;
+   278→  checks.push({
+   279→    label: "Real volume",
+   280→    pass: input.vol5mUsd > V2.volLowUsd,
+   281→    note:
+   282→      input.vol5mUsd > V2.volHighUsd
+   283→        ? `${fmtUsd(input.vol5mUsd)} traded in 5m +10`
+   284→        : input.vol5mUsd < V2.volLowUsd
+   285→          ? `only ${fmtUsd(input.vol5mUsd)} in 5m — low money −20`
+   286→          : `${fmtUsd(input.vol5mUsd)} in 5m (${input.rvol.toFixed(1)}× avg)`,
+   287→  });
+   288→
+   289→  // 3 — sell wall
+   290→  let wall = 0;
+   291→  const wallKnown = input.askWallKnown;
+   292→  const w = input.askWall;
+   293→  if (wallKnown && w === null) {
+   294→    wall += 15; // no wall within 2% above — clear runway
+   295→    checks.push({ label: "Sell wall", pass: true, note: "no ask wall within +2% — clear runway +15" });
+   296→  } else if (wallKnown && w !== null) {
+   297→    const above = input.price > w.price;
+   298→    if (above) {
+   299→      wall += 15;
+   300→      checks.push({
+   301→        label: "Sell wall",
+   302→        pass: true,
+   303→        note: `price is above the ${fmtUsd(w.valueUsd)} wall at ${w.price.toPrecision(6)} +15`,
+   304→      });
+   305→    } else if (w.valueUsd > input.vol5mUsd * V2.wallVsVol) {
+   306→      wall -= 20;
+   307→      checks.push({
+   308→        label: "Sell wall",
+   309→        pass: false,
+   310→        note: `wall ${fmtUsd(w.valueUsd)} > 5m volume ${fmtUsd(input.vol5mUsd)} — cannot break −20`,
+   311→      });
+   312→      warnings.push("Wall too big — cannot break");
+   313→    } else {
+   314→      checks.push({
+   315→        label: "Sell wall",
+   316→        pass: null,
+   317→        note: `wall ${fmtUsd(w.valueUsd)} above, but eatable vs ${fmtUsd(input.vol5mUsd)} volume`,
+   318→      });
+   319→    }
+   320→  } else {
+   321→    checks.push({ label: "Sell wall", pass: null, note: "order book not fetched yet — no wall data" });
+   322→  }
+   323→
+   324→  // 4 — liquidity / trade count
+   325→  let liquidity = 0;
+   326→  if (input.trades5m < V2.tradesLow) liquidity -= 20;
+   327→  else if (input.trades5m > V2.tradesHealthy) liquidity += 5;
+   328→  checks.push({
+   329→    label: "Liquidity",
+   330→    pass: input.trades5m >= V2.tradesLow,
+   331→    note:
+   332→      input.trades5m < V2.tradesLow
+   333→        ? `${input.trades5m} trades in 5m — too thin −20`
+   334→        : input.trades5m > V2.tradesHealthy
+   335→          ? `${input.trades5m} trades in 5m +5`
+   336→          : `${input.trades5m} trades in 5m`,
+   337→  });
+   338→
+   339→  // 5 — buyer trap: high buy% on few trades is a whale painting tape
+   340→  if (input.buyPct > V2.fakeBuyersPct && input.trades5m < V2.fakeBuyersTrades) {
+   341→    warnings.push(`Fake buyers — ${input.buyPct.toFixed(0)}% buys on only ${input.trades5m} trades`);
+   342→  }
+   343→  if (input.buyPct < V2.sellersDumpingPct && input.vol5mUsd > V2.sellersDumpingVolUsd) {
+   344→    warnings.push("Sellers dumping — exit / avoid");
+   345→  }
+   346→
+   347→  const score = input.baseScore + momentum + volume + wall + liquidity;
+   348→  const mode = btcModeFor(input.btcChange15m);
+   349→  const threshold = mode === "flat" ? V2.goScoreFlat : V2.goScore;
+   350→  // 6 — BTC regime gate (not additive — a hard block) + regime alignment:
+   351→  // longs want bull mode (70+) or an exceptional setup in flat mode (80+).
+   352→  let verdict: SideVerdict;
+   353→  if (mode === "dump") {
+   354→    verdict = "blocked_btc";
+   355→    checks.push({ label: "BTC regime", pass: false, note: `BTC 15m ${input.btcChange15m?.toFixed(2)}% — dumping, longs blocked` });
+   356→  } else {
+   357→    checks.push({
+   358→      label: "BTC regime",
+   359→      pass: true,
+   360→      note: mode === "bull" ? `BTC 15m ${input.btcChange15m?.toFixed(2)}% — bull mode` : `BTC 15m ${input.btcChange15m?.toFixed(2)}% — flat, needs ${threshold}+`,
+   361→    });
+   362→    if (score >= threshold) verdict = "go";
+   363→    else if (score >= V2.watchScore) verdict = "watch";
+   364→    else verdict = "skip";
+   365→  }
+   366→
+   367→  // 7 — stablecoin (handled by the caller as a global veto, but reflected here)
+   368→  if (input.isStablecoin) checks.push({ label: "Stablecoin", pass: false, note: "pegged asset — can never pump, veto" });
+   369→
+   370→  // Trade plan + the hard gates that make a "go" honest. A GO is not just a
+   371→  // number — it needs real dollars, real participation, volume expansion, the
+   372→  // crowd on the right side, an un-extended day, and a profit zone nothing
+   373→  // blocks.
+   374→  const trade = buildTradePlan("long", input.price, input.atrPct, input.askWallKnown ? input.askWall : null, input.vol5mUsd);
+   375→  if (verdict === "go") {
+   376→    const greenGate = m5 > V2.momentumGreen && m15 > V2.momentumGreen;
+   377→    const dayGate = input.change24h >= V2.goLongDayMin && input.change24h <= V2.goLongDayMax;
+   378→    const volumeGate = input.vol5mUsd > V2.volLowUsd;
+   379→    const liquidityGate = input.trades5m >= V2.tradesLow;
+   380→    const expansionGate = input.rvol >= V2.goMinRvol;
+   381→    const crowdGate = input.buyPct >= V2.goMinBuyPctLong;
+   382→    const btc1hGate = input.btcChange1h === null || input.btcChange1h > -0.1; // 15m bull in a 1h downtrend = trap
+   383→    if (!greenGate) {
+   384→      verdict = "watch";
+   385→      warnings.push("Price not green on both 5m and 15m — demoted to watch");
+   386→    } else if (!btc1hGate) {
+   387→      verdict = "watch";
+   388→      warnings.push(`BTC 1h ${input.btcChange1h?.toFixed(2)}% falling — bull-trap risk, demoted to watch`);
+   389→    } else if (!dayGate) {
+   390→      verdict = "watch";
+   391→      warnings.push(
+   392→        input.change24h > V2.goLongDayMax
+   393→          ? `Day already +${input.change24h.toFixed(1)}% — the move happened without you`
+   394→          : `Day ${input.change24h.toFixed(1)}% — falling knife, not a long`,
+   395→      );
+   396→    } else if (!volumeGate) {
+   397→      verdict = "watch";
+   398→      warnings.push(`Low money — ${fmtUsd(input.vol5mUsd)} in 5m — demoted to watch`);
+   399→    } else if (!liquidityGate) {
+   400→      verdict = "watch";
+   401→      warnings.push(`Too thin — ${input.trades5m} trades — demoted to watch`);
+   402→    } else if (!expansionGate) {
+   403→      verdict = "watch";
+   404→      warnings.push(`No volume expansion (${input.rvol.toFixed(2)}×) — demoted to watch`);
+   405→    } else if (!crowdGate) {
+   406→      verdict = "watch";
+   407→      warnings.push(`Buyers only ${input.buyPct.toFixed(0)}% of tape — demoted to watch`);
+   408→    } else if (trade.blocked) {
+   409→      verdict = "watch";
+   410→      warnings.push(trade.blockReason ?? "take-profit blocked by wall");
+   411→    } else if (wallKnown && w !== null && input.price < w.price && w.valueUsd > input.vol5mUsd * V2.wallVsVol) {
+   412→      verdict = "watch";
+   413→      warnings.push("Below an unbreakable wall — wait for the break");
+   414→    }
+   415→  }
+   416→
+   417→  return { score, verdict, checks, trade };
+   418→}
+   419→
+   420→/** SHORT side — the mirror of the long filters for dumping coins. */
+   421→export function assessShort(input: V2Input): SideAssessment {
+   422→  const checks: V2Check[] = [];
+   423→  const warnings: string[] = [];
+   424→
+   425→  // Momentum must be red and staying red.
+   426→  let momentum = 0;
+   427→  const m5 = input.change5m;
+   428→  const m15 = input.change15m;
+   429→  if (m5 < -V2.momentumGreen && m15 < -V2.momentumGreen) momentum += 15;
+   430→  if (m5 > 0 || m15 > 0) momentum -= 20;
+   431→  if (input.change1m > -V2.momentum1mRed) momentum -= 10;
+   432→  checks.push({
+   433→    label: "Momentum",
+   434→    pass: m5 < -V2.momentumGreen && m15 < -V2.momentumGreen,
+   435→    note:
+   436→      m5 < -V2.momentumGreen && m15 < -V2.momentumGreen
+   437→        ? `5m ${m5.toFixed(2)}% and 15m ${m15.toFixed(2)}% both red +15`
+   438→        : m5 > 0 || m15 > 0
+   439→          ? `tape green (5m ${m5.toFixed(2)}%, 15m ${m15.toFixed(2)}%) −20`
+   440→          : `tape not red enough (5m ${m5.toFixed(2)}%, 15m ${m15.toFixed(2)}%)`,
+   441→  });
+   442→
+   443→  // Real dollar volume — same rule both directions.
+   444→  let volume = 0;
+   445→  if (input.vol5mUsd > V2.volHighUsd) volume += 10;
+   446→  else if (input.vol5mUsd < V2.volLowUsd) volume -= 20;
+   447→  checks.push({
+   448→    label: "Real volume",
+   449→    pass: input.vol5mUsd > V2.volLowUsd,
+   450→    note:
+   451→      input.vol5mUsd > V2.volHighUsd
+   452→        ? `${fmtUsd(input.vol5mUsd)} traded in 5m +10`
+   453→        : input.vol5mUsd < V2.volLowUsd
+   454→          ? `only ${fmtUsd(input.vol5mUsd)} in 5m — low money −20`
+   455→          : `${fmtUsd(input.vol5mUsd)} in 5m (${input.rvol.toFixed(1)}× avg)`,
+   456→  });
+   457→
+   458→  // Wall logic inverts: an unbreakable ask wall ABOVE price is a ceiling that
+   459→  // helps the short; a bid wall below is the floor that breaks it.
+   460→  let wall = 0;
+   461→  const wallKnown = input.askWallKnown;
+   462→  const ask = input.askWall;
+   463→  const bid = input.bidWall;
+   464→  if (wallKnown && ask !== null && input.price < ask.price && ask.valueUsd > input.vol5mUsd * V2.wallVsVol) {
+   465→    wall += 15;
+   466→    checks.push({
+   467→      label: "Ceiling wall",
+   468→      pass: true,
+   469→      note: `unbreakable ${fmtUsd(ask.valueUsd)} ask wall overhead +15`,
+   470→    });
+   471→  } else if (wallKnown && ask !== null && input.price > ask.price) {
+   472→    wall -= 20;
+   473→    checks.push({ label: "Ceiling wall", pass: false, note: "price already above the wall — breakout risk −20" });
+   474→  } else {
+   475→    checks.push({ label: "Ceiling wall", pass: null, note: wallKnown ? "no meaningful wall overhead" : "order book not fetched yet" });
+   476→  }
+   477→  if (wallKnown && bid !== null && bid.valueUsd > input.vol5mUsd * V2.wallVsVol && input.price - bid.price < input.price * 0.02) {
+   478→    wall -= 15;
+   479→    checks.push({
+   480→      label: "Bid floor",
+   481→      pass: false,
+   482→      note: `bid wall ${fmtUsd(bid.valueUsd)} below — short squeeze risk −15`,
+   483→    });
+   484→  }
+   485→
+   486→  // Liquidity — same rule both directions.
+   487→  let liquidity = 0;
+   488→  if (input.trades5m < V2.tradesLow) liquidity -= 20;
+   489→  else if (input.trades5m > V2.tradesHealthy) liquidity += 5;
+   490→  checks.push({
+   491→    label: "Liquidity",
+   492→    pass: input.trades5m >= V2.tradesLow,
+   493→    note:
+   494→      input.trades5m < V2.tradesLow
+   495→        ? `${input.trades5m} trades in 5m — too thin −20`
+   496→        : input.trades5m > V2.tradesHealthy
+   497→            ? `${input.trades5m} trades in 5m +5`
+   498→            : `${input.trades5m} trades in 5m`,
+   499→  });
+   500→
+   501→  // Seller pressure bonus — the mirror of the buyer trap.
+   502→  let seller = 0;
+   503→  if (input.buyPct < V2.sellersDumpingPct && input.vol5mUsd > V2.volLowUsd) {
+   504→    seller += 10;
+   505→    checks.push({ label: "Seller pressure", pass: true, note: `takers only ${(100 - input.buyPct).toFixed(0)}% buys — sellers in control +10` });
+   506→  } else if (input.buyPct > 60) {
+   507→    seller -= 15;
+   508→    checks.push({ label: "Seller pressure", pass: false, note: `buyers ${input.buyPct.toFixed(0)}% of the tape — fighting the flow −15` });
+   509→  } else {
+   510→    checks.push({ label: "Seller pressure", pass: null, note: `takers ${input.buyPct.toFixed(0)}% buys — balanced` });
+   511→  }
+   512→
+   513→  const score = input.baseScore + momentum + volume + wall + liquidity + seller;
+   514→  const mode = btcModeFor(input.btcChange15m);
+   515→
+   516→  let verdict: SideVerdict;
+   517→  if (mode === "bull") {
+   518→    verdict = "blocked_btc";
+   519→    checks.push({ label: "BTC regime", pass: false, note: `BTC 15m ${input.btcChange15m?.toFixed(2)}% — bull mode, shorts blocked` });
+   520→  } else {
+   521→    checks.push({
+   522→      label: "BTC regime",
+   523→      pass: true,
+   524→      note:
+   525→        mode === "dump"
+   526→          ? `BTC 15m ${input.btcChange15m?.toFixed(2)}% — dumping, shorts favoured`
+   527→          : `BTC 15m ${input.btcChange15m?.toFixed(2)}% — flat, needs ${V2.goScoreFlat}+`,
+   528→    });
+   529→    // Dump mode eases the bar (the tape is already with you); flat mode
+   530→    // demands an exceptional setup, same as longs.
+   531→    const threshold = mode === "dump" ? V2.goScore - 5 : V2.goScoreFlat;
+   532→    if (score >= threshold) verdict = "go";
+   533→    else if (score >= V2.watchScore) verdict = "watch";
+   534→    else verdict = "skip";
+   535→  }
+   536→
+   537→  if (input.isStablecoin) checks.push({ label: "Stablecoin", pass: false, note: "pegged asset — veto" });
+   538→
+   539→  const trade = buildTradePlan("short", input.price, input.atrPct, input.bidWall, input.vol5mUsd);
+   540→  if (verdict === "go") {
+   541→    const redGate = m5 < -V2.momentumGreen && m15 < -V2.momentumGreen;
+   542→    const dayGate = input.change24h >= V2.goShortDayMin && input.change24h <= V2.goShortDayMax;
+   543→    const volumeGate = input.vol5mUsd > V2.volLowUsd;
+   544→    const liquidityGate = input.trades5m >= V2.tradesLow;
+   545→    const expansionGate = input.rvol >= V2.goMinRvol;
+   546→    const crowdGate = input.buyPct <= V2.goMinBuyPctShort;
+   547→    const btc1hGate = input.btcChange1h === null || input.btcChange1h < 0.1; // 15m dip in a 1h uptrend = dip-buy zone
+   548→    if (!redGate) {
+   549→      verdict = "watch";
+   550→      warnings.push("Price not red on both 5m and 15m — demoted to watch");
+   551→    } else if (!btc1hGate) {
+   552→      verdict = "watch";
+   553→      warnings.push(`BTC 1h ${input.btcChange1h?.toFixed(2)}% rising — dip gets bought, demoted to watch`);
+   554→    } else if (!dayGate) {
+   555→      verdict = "watch";
+   556→      warnings.push(
+   557→        input.change24h < V2.goShortDayMin
+   558→          ? `Day ${input.change24h.toFixed(1)}% — crash mostly done, bounce risk`
+   559→          : `Day +${input.change24h.toFixed(1)}% — day trend fights the short`,
+   560→      );
+   561→    } else if (!volumeGate) {
+   562→      verdict = "watch";
+   563→      warnings.push(`Low money — ${fmtUsd(input.vol5mUsd)} in 5m — demoted to watch`);
+   564→    } else if (!liquidityGate) {
+   565→      verdict = "watch";
+   566→      warnings.push(`Too thin — ${input.trades5m} trades — demoted to watch`);
+   567→    } else if (!expansionGate) {
+   568→      verdict = "watch";
+   569→      warnings.push(`No volume expansion (${input.rvol.toFixed(2)}×) — demoted to watch`);
+   570→    } else if (!crowdGate) {
+   571→      verdict = "watch";
+   572→      warnings.push(`Sellers only ${(100 - input.buyPct).toFixed(0)}% of tape — demoted to watch`);
+   573→    } else if (trade.blocked) {
+   574→      verdict = "watch";
+   575→      warnings.push(trade.blockReason ?? "take-profit blocked by bid wall");
+   576→    }
+   577→  }
+   578→
+   579→  return { score, verdict, checks, trade };
+   580→}
+   581→
+   582→// ── Scenario map — what could happen, BEFORE the decision ────────────────────
+   583→
+   584→export type Scenario = { tone: "bull" | "base" | "bear"; title: string; body: string };
+   585→
+   586→export function buildScenarios(input: V2Input, long: SideAssessment, short: SideAssessment): Scenario[] {
+   587→  const bull: string[] = [];
+   588→  const bear: string[] = [];
+   589→  const w = input.askWall;
+   590→
+   591→  if (input.rvol >= 2) bull.push(`volume holds above ${input.rvol.toFixed(1)}× average`);
+   592→  if (input.buyPct >= 55) bull.push(`takers keep buying (${input.buyPct.toFixed(0)}% of tape)`);
+   593→  if (input.btcChange15m !== null && input.btcChange15m > 0.1) bull.push("BTC regime stays supportive");
+   594→  if (w && input.price > w.price) bull.push("the broken wall stays broken — old resistance becomes support");
+   595→  if (!w) bull.push("thin asks overhead — runway to TP2");
+   596→
+   597→  if (input.buyPct < 45) bear.push(`sellers own the tape (${(100 - input.buyPct).toFixed(0)}% sells)`);
+   598→  if (input.rvol < 1.2) bear.push("volume fades back to average — the move starves");
+   599→  if (w && input.price < w.price && w.valueUsd > input.vol5mUsd) bear.push(`the ${fmtUsd(w.valueUsd)} wall refuses to break`);
+   600→  if (input.btcChange15m !== null && input.btcChange15m < -0.1) bear.push("BTC rolls over");
+   601→  if (input.trades5m < V2.tradesLow) bear.push("thin trade count — one whale flips it");
+   602→
+   603→  const risk = long.trade?.riskPct ?? 1;
+   604→  const scenarios: Scenario[] = [
+   605→    {
+   606→      tone: "bull",
+   607→      title: long.verdict === "go" ? "Confirms → ride to TP" : "Bull case",
+   608→      body: `${bull.length > 0 ? bull.slice(0, 3).join("; ") : "momentum and flow keep building"}. Price clears +${((long.trade?.tp1Pct ?? risk * 2)).toFixed(1)}% (TP1), runner to +${((long.trade?.tp2Pct ?? risk * 3.5)).toFixed(1)}% (TP2).`,
+   609→    },
+   610→    {
+   611→      tone: "base",
+   612→      title: "Base case — chop",
+   613→      body: `Volume normalises, price chops ±${(input.atrPct ?? 0.5).toFixed(2)}% for an hour. No trade needed — waiting is the position.`,
+   614→    },
+   615→    {
+   616→      tone: "bear",
+   617→      title: "Invalidated → stop",
+   618→      body: `${bear.length > 0 ? bear.slice(0, 3).join("; ") : "flow flips against the setup"}. Stop −${risk.toFixed(1)}% takes the small loss; short watch begins if tape stays red (short score ${short.score}).`,
+   619→    },
+   620→  ];
+   621→  return scenarios;
+   622→}
+   623→
+   624→// ── Row-level V2 assessment (combines both sides) ────────────────────────────
+   625→
+   626→export type RowVerdict = "go_long" | "go_short" | "watch" | "skip" | "blocked_btc" | "stable";
+   627→
+   628→export type RowV2 = {
+   629→  longScore: number;
+   630→  shortScore: number;
+   631→  verdict: RowVerdict;
+   632→  longVerdict: SideVerdict;
+   633→  shortVerdict: SideVerdict;
+   634→  checks: V2Check[]; // long-side checks (the primary read)
+   635→  shortChecks: V2Check[];
+   636→  warnings: string[];
+   637→  wall: { price: number; valueUsd: number; distPct: number } | null;
+   638→  bidWall: { price: number; valueUsd: number; distPct: number } | null;
+   639→  wallKnown: boolean;
+   640→  wallBroken: boolean | null;
+   641→  atrPct: number | null;
+   642→  trade: TradePlan | null;
+   643→  shortTrade: TradePlan | null;
+   644→  scenarios: Scenario[];
+   645→};
+   646→
+   647→export function assessRow(input: V2Input): RowV2 {
+   648→  const long = assessLong(input);
+   649→  const short = assessShort(input);
+   650→  const scenarios = buildScenarios(input, long, short);
+   651→
+   652→  let verdict: RowVerdict;
+   653→  if (input.isStablecoin) verdict = "stable";
+   654→  else if (long.verdict === "go") verdict = "go_long";
+   655→  else if (short.verdict === "go") verdict = "go_short";
+   656→  else if (long.verdict === "blocked_btc") verdict = "blocked_btc";
+   657→  else if (long.verdict === "watch" || short.verdict === "watch") verdict = "watch";
+   658→  else verdict = "skip";
+   659→
+   660→  const warnings = [
+   661→    ...assessLongWarnings(input),
+   662→    ...(short.verdict === "go" ? ["Short setup stronger — tape is dumping"] : []),
+   663→  ];
+   664→
+   665→  const w = input.askWall;
+   666→  const bid = input.bidWall;
+   667→
+   668→  return {
+   669→    longScore: Math.round(long.score),
+   670→    shortScore: Math.round(short.score),
+   671→    verdict,
+   672→    longVerdict: long.verdict,
+   673→    shortVerdict: short.verdict,
+   674→    checks: long.checks,
+   675→    shortChecks: short.checks,
+   676→    warnings,
+   677→    wall:
+   678→      w !== null
+   679→        ? { price: w.price, valueUsd: w.valueUsd, distPct: input.price > 0 ? ((w.price - input.price) / input.price) * 100 : 0 }
+   680→        : null,
+   681→    bidWall:
+   682→      bid !== null
+   683→        ? { price: bid.price, valueUsd: bid.valueUsd, distPct: input.price > 0 ? ((bid.price - input.price) / input.price) * 100 : 0 }
+   684→        : null,
+   685→    wallKnown: input.askWallKnown,
+   686→    wallBroken: input.wallBrokenConfirmed,
+   687→    atrPct: input.atrPct,
+   688→    trade: long.trade,
+   689→    shortTrade: short.trade,
+   690→    scenarios,
+   691→  };
+   692→}
+   693→
+   694→function assessLongWarnings(input: V2Input): string[] {
+   695→  const warnings: string[] = [];
+   696→  if (input.buyPct > V2.fakeBuyersPct && input.trades5m < V2.fakeBuyersTrades) {
+   697→    warnings.push(`Fake buyers — ${input.buyPct.toFixed(0)}% buys on only ${input.trades5m} trades`);
+   698→  }
+   699→  if (input.buyPct < V2.sellersDumpingPct && input.vol5mUsd > V2.sellersDumpingVolUsd) {
+   700→    warnings.push("Sellers dumping — exit / avoid");
+   701→  }
+   702→  if (input.vol5mUsd < V2.volLowUsd) warnings.push(`Low money — ${fmtUsd(input.vol5mUsd)} in 5m`);
+   703→  if (input.askWallKnown && input.askWall !== null && input.price < input.askWall.price && input.askWall.valueUsd > input.vol5mUsd) {
+   704→    warnings.push("Wall too big — cannot break");
+   705→  }
+   706→  return warnings;
+   707→}
+   708→
+   709→// ── Cooldown ledger — stop the flip-flop ─────────────────────────────────────
+   710→
+   711→export class CooldownLedger {
+   712→  private longBlocked = new Map<string, number>();
+   713→  private shortBlocked = new Map<string, number>();
+   714→  private lastLong = new Map<string, number>();
+   715→  private lastShort = new Map<string, number>();
+   716→
+   717→  /** Call when a bearish (exit/dump) signal fires — blocks longs for an hour. */
+   718→  bearishSignal(pair: string, now = Date.now()): void {
+   719→    this.longBlocked.set(pair, Math.max(this.longBlocked.get(pair) ?? 0, now + V2.longBlockAfterBearishMs));
+   720→  }
+   721→
+   722→  longSignal(pair: string, now = Date.now()): void {
+   723→    this.lastLong.set(pair, now);
+   724→    this.shortBlocked.set(pair, Math.max(this.shortBlocked.get(pair) ?? 0, now + V2.shortBlockAfterLongMs));
+   725→  }
+   726→
+   727→  shortSignal(pair: string, now = Date.now()): void {
+   728→    this.lastShort.set(pair, now);
+   729→    this.longBlocked.set(pair, Math.max(this.longBlocked.get(pair) ?? 0, now + V2.longBlockAfterShortMs));
+   730→  }
+   731→
+   732→  longAllowed(pair: string, now = Date.now()): boolean {
+   733→    return (this.longBlocked.get(pair) ?? 0) <= now;
+   734→  }
+   735→
+   736→  shortAllowed(pair: string, now = Date.now()): boolean {
+   737→    return (this.shortBlocked.get(pair) ?? 0) <= now;
+   738→  }
+   739→
+   740→  /** Has this pair fired the same-side go signal recently? (repeat damping) */
+   741→  repeatLong(pair: string, now = Date.now()): boolean {
+   742→    return now - (this.lastLong.get(pair) ?? 0) < V2.signalRepeatMs;
+   743→  }
+   744→
+   745→  repeatShort(pair: string, now = Date.now()): boolean {
+   746→    return now - (this.lastShort.get(pair) ?? 0) < V2.signalRepeatMs;
+   747→  }
+   748→
+   749→  remainingLongBlockMs(pair: string, now = Date.now()): number {
+   750→    return Math.max(0, (this.longBlocked.get(pair) ?? 0) - now);
+   751→  }
+   752→}
+   753→
+   754→// ── Backtest core — prove the filters before trusting them ───────────────────
+   755→//
+   756→// Replays 5-minute bars through the same seven filters (wall filter skipped —
+   757→// historical order books are not available for free; the backtest says so
+   758→// honestly) and grades every go-signal against its own stop/targets.
+   759→
+   760→export type BacktestBar = {
+   761→  t: number; // open time, ms
+   762→  o: number;
+   763→  h: number;
+   764→  l: number;
+   765→  c: number;
+   766→  quoteVol: number; // USD volume of the bar
+   767→  trades: number;
+   768→  takerBuyQuote: number; // USD taker-buy volume of the bar
+   769→};
+   770→
+   771→export type BacktestTrade = {
+   772→  pair: string;
+   773→  side: "long" | "short";
+   774→  time: number; // signal bar open time
+   775→  entry: number;
+   776→  stop: number;
+   777→  tp1: number;
+   778→  tp2: number;
+   779→  exitTime: number | null;
+   780→  exitPrice: number | null;
+   781→  outcome: "win" | "big_win" | "loss" | "timeout";
+   782→  pnlPct: number;
+   783→  bars: number;
+   784→  score: number;
+   785→};
+   786→
+   787→export type BacktestStats = {
+   788→  trades: number;
+   789→  wins: number;
+   790→  bigWins: number;
+   791→  losses: number;
+   792→  timeouts: number;
+   793→  winRate: number | null; // (wins + bigWins) / decided
+   794→  avgWinPct: number | null;
+   795→  avgLossPct: number | null;
+   796→  profitFactor: number | null; // gross win / gross loss
+   797→  expectancyPct: number | null; // avg pnl per trade
+   798→};
+   799→
+   800→export function emptyStats(): BacktestStats {
+   801→  return {
+   802→    trades: 0,
+   803→    wins: 0,
+   804→    bigWins: 0,
+   805→    losses: 0,
+   806→    timeouts: 0,
+   807→    winRate: null,
+   808→    avgWinPct: null,
+   809→    avgLossPct: null,
+   810→    profitFactor: null,
+   811→    expectancyPct: null,
+   812→  };
+   813→}
+   814→
+   815→const MAX_FORWARD_BARS = 24; // 2 hours to resolve, else timeout
+   816→
+   817→/**
+   818→ * Runs the V2 long+short simulation over one symbol's 5m bars.
+   819→ * `btcBars` supplies the BTC regime at each timestamp (aligned by index from
+   820→ * the end — the caller fetches the same window for BTC).
+   821→ */
+   822→export function backtestSymbol(pair: string, bars: BacktestBar[], btcBars: BacktestBar[]): { longs: BacktestTrade[]; shorts: BacktestTrade[] } {
+   823→  const longs: BacktestTrade[] = [];
+   824→  const shorts: BacktestTrade[] = [];
+   825→  if (bars.length < 40) return { longs, shorts };
+   826→
+   827→  const ledger = new CooldownLedger();
+   828→  const atrCaches = new Map<number, number | null>();
+   829→
+   830→  // Rolling ATR on 5m bars, expressed as an estimated 1m ATR (÷2.2 — the
+   831→  // √time scaling of a random walk) so stop distances match live semantics.
+   832→  const atrAt = (i: number): number | null => {
+   833→    const cached = atrCaches.get(i);
+   834→    if (cached !== undefined) return cached;
+   835→    const slice = bars.slice(Math.max(0, i - 15), i + 1).map((b) => ({ high: b.h, low: b.l, close: b.c }));
+   836→    const atr = slice.length >= 15 ? atrPctFromCandles(slice, 14) : null;
+   837→    const est = atr !== null ? atr / 2.2 : null;
+   838→    atrCaches.set(i, est);
+   839→    return est;
+   840→  };
+   841→
+   842→  const btcIndex = new Map<number, number>(); // 5m-bucket → index, for O(1) regime lookups
+   843→  for (let i = 0; i < btcBars.length; i += 1) btcIndex.set(Math.floor(btcBars[i].t / 300_000), i);
+   844→
+   845→  const btcChange15mAt = (t: number): number | null => {
+   846→    // BTC 15m = the three closed BTC 5m bars before this bar opened.
+   847→    const i = btcIndex.get(Math.floor(t / 300_000) - 1);
+   848→    if (i === undefined || i < 2) return null;
+   849→    const start = btcBars[i - 2];
+   850→    const end = btcBars[i];
+   851→    return start.o > 0 ? ((end.c - start.o) / start.o) * 100 : null;
+   852→  };
+   853→
+   854→  const btcChange1hAt = (t: number): number | null => {
+   855→    // BTC 1h = the twelve closed BTC 5m bars before this bar opened.
+   856→    const i = btcIndex.get(Math.floor(t / 300_000) - 1);
+   857→    if (i === undefined || i < 11) return null;
+   858→    const start = btcBars[i - 11];
+   859→    const end = btcBars[i];
+   860→    return start.o > 0 ? ((end.c - start.o) / start.o) * 100 : null;
+   861→  };
+   862→
+   863→  const grade = (side: "long" | "short", signalBar: number): BacktestTrade | null => {
+   864→    const bar = bars[signalBar];
+   865→    if (!bar) return null;
+   866→    const atr = atrAt(signalBar);
+   867→    const plan = buildTradePlan(side, bar.c, atr, null, bar.quoteVol);
+   868→    for (let j = signalBar + 1; j < Math.min(bars.length, signalBar + 1 + MAX_FORWARD_BARS); j += 1) {
+   869→      const fwd = bars[j];
+   870→      if (!fwd) break;
+   871→      const hitStop = side === "long" ? fwd.l <= plan.stop : fwd.h >= plan.stop;
+   872→      const hitTp2 = side === "long" ? fwd.h >= plan.tp2 : fwd.l <= plan.tp2;
+   873→      const hitTp1 = side === "long" ? fwd.h >= plan.tp1 : fwd.l <= plan.tp1;
+   874→      // Conservative ordering: same-bar stop + target → stop wins.
+   875→      if (hitStop) {
+   876→        return {
+   877→          pair, side, time: bar.t, entry: bar.c, stop: plan.stop, tp1: plan.tp1, tp2: plan.tp2,
+   878→          exitTime: fwd.t, exitPrice: plan.stop, outcome: "loss", pnlPct: -plan.riskPct, bars: j - signalBar,
+   879→          score: 0,
+   880→        };
+   881→      }
+   882→      if (hitTp2) {
+   883→        return {
+   884→          pair, side, time: bar.t, entry: bar.c, stop: plan.stop, tp1: plan.tp1, tp2: plan.tp2,
+   885→          exitTime: fwd.t, exitPrice: plan.tp2, outcome: "big_win", pnlPct: plan.tp2Pct, bars: j - signalBar,
+   886→          score: 0,
+   887→        };
+   888→      }
+   889→      if (hitTp1) {
+   890→        return {
+   891→          pair, side, time: bar.t, entry: bar.c, stop: plan.stop, tp1: plan.tp1, tp2: plan.tp2,
+   892→          exitTime: fwd.t, exitPrice: plan.tp1, outcome: "win", pnlPct: plan.tp1Pct, bars: j - signalBar,
+   893→          score: 0,
+   894→        };
+   895→      }
+   896→    }
+   897→    const last = bars[Math.min(bars.length - 1, signalBar + MAX_FORWARD_BARS)];
+   898→    if (!last) return null;
+   899→    const pnl = side === "long" ? (last.c - bar.c) / bar.c * 100 : (bar.c - last.c) / bar.c * 100;
+   900→    return {
+   901→      pair, side, time: bar.t, entry: bar.c, stop: plan.stop, tp1: plan.tp1, tp2: plan.tp2,
+   902→      exitTime: last.t, exitPrice: last.c, outcome: "timeout", pnlPct: pnl, bars: MAX_FORWARD_BARS,
+   903→      score: 0,
+   904→    };
+   905→  };
+   906→
+   907→  for (let i = 16; i < bars.length - 1; i += 1) {
+   908→    const bar = bars[i];
+   909→    const prev = bars[i - 1];
+   910→    if (!bar || !prev || bar.c <= 0) continue;
+   911→
+   912→    // Baseline: the 12 bars BEFORE the signal bar (one hour, excluding the
+   913→    // spike itself — including it would dampen the very expansion we measure).
+   914→    const window = bars.slice(i - 17, i - 5);
+   915→    const baselineVol = window.length > 0 ? window.reduce((a, b) => a + b.quoteVol, 0) / window.length : 0;
+   916→    const baselineTrades = window.length > 0 ? window.reduce((a, b) => a + b.trades, 0) / window.length : 0;
+   917→    const vol5mUsd = prev.quoteVol; // last CLOSED bar is the "now" tape
+   918→    const trades5m = prev.trades;
+   919→    const rvol = baselineVol > 0 ? vol5mUsd / baselineVol : 0;
+   920→    const tradeSpike = baselineTrades > 0 ? trades5m / baselineTrades : 0;
+   921→    const buyPct = prev.quoteVol > 0 ? (prev.takerBuyQuote / prev.quoteVol) * 100 : 50;
+   922→
+   923→    // Momentum on the 5m grid: 1 bar = 5m, 3 bars = 15m.
+   924→    const c5m = bars[i - 1].c;
+   925→    const c15m = bars[i - 3]?.c ?? c5m;
+   926→    const change5m = c5m > 0 && bars[i - 2] ? ((c5m - bars[i - 2].c) / bars[i - 2].c) * 100 : 0;
+   927→    const change15m = c15m > 0 && bars[i - 4] ? ((c15m - bars[i - 4].c) / bars[i - 4].c) * 100 : 0;
+   928→    const change1m = prev.o > 0 ? ((prev.c - prev.o) / prev.o) * 100 : 0; // intra-bar proxy
+   929→
+   930→    // Close strength of the last closed bar.
+   931→    const strength = prev.h > prev.l ? (prev.c - prev.l) / (prev.h - prev.l) : 0.5;
+   932→
+   933→    // Base score — same shape as the live scanner.
+   934→    const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
+   935→    const rvolPts = 30 * clamp01((rvol - 1) / 4);
+   936→    const tradePts = 10 * clamp01((tradeSpike - 1) / 4);
+   937→    let momentumPts = 0;
+   938→    if (change1m > 0 && change5m > 0 && change15m > 0) momentumPts += 10;
+   939→    if (change5m > 0 && change5m >= change15m) momentumPts += 8;
+   940→    if (change1m > 0 && change1m >= change5m) momentumPts += 7;
+   941→    const buyPts = 20 * clamp01((buyPct - 50) / 30);
+   942→    const closePts = 15 * clamp01(strength);
+   943→    const baseScore = Math.round(Math.min(100, Math.max(0, rvolPts + tradePts + momentumPts + buyPts + closePts)));
+   944→
+   945→    const stable = stablecoinLike(bar.c, change15m, 0);
+   946→    const btcChange15m = btcChange15mAt(bar.t);
+   947→    // Rolling 24h change (288 bars) — the day-extension gate reads this. Near
+   948→    // the start of the window the oldest available span stands in.
+   949→    const dayStart = bars[Math.max(0, i - 288)];
+   950→    const change24h = dayStart && dayStart.o > 0 ? ((bar.c - dayStart.o) / dayStart.o) * 100 : 0;
+   951→
+   952→    const input: V2Input = {
+   953→      base: pair.replace(/USDT$/, ""),
+   954→      price: bar.c,
+   955→      change1m,
+   956→      change5m,
+   957→      change15m,
+   958→      change24h,
+   959→      vol5mUsd,
+   960→      rvol,
+   961→      trades5m,
+   962→      buyPct,
+   963→      baseScore,
+   964→      atrPct: atrAt(i - 1),
+   965→      askWall: null,
+   966→      bidWall: null,
+   967→      askWallKnown: false, // no historical order books — wall filter honestly off
+   968→      wallBrokenConfirmed: null,
+   969→      btcChange15m,
+   970→      btcChange1h: btcChange1hAt(bar.t),
+   971→      isStablecoin: stable,
+   972→    };
+   973→
+   974→    const now = bar.t;
+   975→    const long = assessLong(input);
+   976→    const short = assessShort(input);
+   977→
+   978→    if (long.verdict === "go" && ledger.longAllowed(pair, now) && !ledger.repeatLong(pair, now)) {
+   979→      const trade = grade("long", i);
+   980→      if (trade) {
+   981→        trade.score = long.score;
+   982→        longs.push(trade);
+   983→        ledger.longSignal(pair, now);
+   984→        // A long that stops out is a bearish event — cooldown the pair.
+   985→        if (trade.outcome === "loss") ledger.bearishSignal(pair, trade.exitTime ?? now);
+   986→      }
+   987→    }
+   988→    if (short.verdict === "go" && ledger.shortAllowed(pair, now) && !ledger.repeatShort(pair, now)) {
+   989→      const trade = grade("short", i);
+   990→      if (trade) {
+   991→        trade.score = short.score;
+   992→        shorts.push(trade);
+   993→        ledger.shortSignal(pair, now);
+   994→      }
+   995→    }
+   996→  }
+   997→
+   998→  return { longs, shorts };
+   999→}
+  1000→
+  1001→export function statsFor(trades: BacktestTrade[]): BacktestStats {
+  1002→  const stats = emptyStats();
+  1003→  stats.trades = trades.length;
+  1004→  let grossWin = 0;
+  1005→  let grossLoss = 0;
+  1006→  let winSum = 0;
+  1007→  let lossSum = 0;
+  1008→  let pnlSum = 0;
+  1009→  for (const t of trades) {
+  1010→    pnlSum += t.pnlPct;
+  1011→    if (t.outcome === "win" || t.outcome === "big_win") {
+  1012→      if (t.outcome === "big_win") stats.bigWins += 1;
+  1013→      else stats.wins += 1;
+  1014→      grossWin += t.pnlPct;
+  1015→      winSum += t.pnlPct;
+  1016→    } else if (t.outcome === "loss") {
+  1017→      stats.losses += 1;
+  1018→      grossLoss += Math.abs(t.pnlPct);
+  1019→      lossSum += t.pnlPct;
+  1020→    } else {
+  1021→      stats.timeouts += 1;
+  1022→    }
+  1023→  }
+  1024→  const decided = stats.wins + stats.bigWins + stats.losses;
+  1025→  stats.winRate = decided > 0 ? (stats.wins + stats.bigWins) / decided : null;
+  1026→  stats.avgWinPct = stats.wins + stats.bigWins > 0 ? winSum / (stats.wins + stats.bigWins) : null;
+  1027→  stats.avgLossPct = stats.losses > 0 ? lossSum / stats.losses : null;
+  1028→  stats.profitFactor = grossLoss > 0 ? grossWin / grossLoss : grossWin > 0 ? Infinity : null;
+  1029→  stats.expectancyPct = trades.length > 0 ? pnlSum / trades.length : null;
+  1030→  return stats;
+  1031→}
+  1032→
+  1033→// ── Convenience: V2 fields from a live RadarRow-shaped input ─────────────────
+  1034→
+  1035→export function rowInputFromRadar(row: RadarRow, extras: {
+  1036→  atrPct: number | null;
+  1037→  askWall: V2Wall;
+  1038→  bidWall: V2Wall;
+  1039→  askWallKnown: boolean;
+  1040→  wallBrokenConfirmed: boolean | null;
+  1041→  btcChange15m: number | null;
+  1042→  btcChange1h?: number | null;
+  1043→  isStablecoin?: boolean;
+  1044→}): V2Input {
+  1045→  return {
+  1046→    base: row.base,
+  1047→    price: row.price,
+  1048→    change1m: row.change1m,
+  1049→    change5m: row.change5m,
+  1050→    change15m: row.change15m,
+  1051→    change24h: row.change24h,
+  1052→    vol5mUsd: row.vol5mUsd,
+  1053→    rvol: row.rvol,
+  1054→    trades5m: row.trades5m,
+  1055→    buyPct: row.buyPct,
+  1056→    baseScore: row.score,
+  1057→    atrPct: extras.atrPct,
+  1058→    askWall: extras.askWall,
+  1059→    bidWall: extras.bidWall,
+  1060→    askWallKnown: extras.askWallKnown,
+  1061→    wallBrokenConfirmed: extras.wallBrokenConfirmed,
+  1062→    btcChange15m: extras.btcChange15m,
+  1063→    btcChange1h: extras.btcChange1h ?? null,
+  1064→    isStablecoin: extras.isStablecoin ?? stablecoinLike(row.price, row.change15m, row.change24h),
+  1065→  };
+  1066→}
+  1067→

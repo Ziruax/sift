@@ -34,6 +34,13 @@
 // coin's own noise, and shows the scenario map before the decision.
 
 import type { RadarRow } from "./types";
+import {
+  nextBtcRegime,
+  nextVerdictState,
+  replayVerdictConfig,
+  type BtcRegimeState,
+  type VerdictState,
+} from "./verdict-state";
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 //
@@ -135,6 +142,30 @@ export const V2 = {
   correlationMax: 0.7,
   killSwitchLossStreak: 5,
   killSwitchDayLossR: -6, // ≈ −3% equity at 0.5% risk per trade
+  // ── V2.2 Verdict stability — the state layer's hysteresis pairs ──────────
+  // Exit thresholds sit 30–40% of the way from entry toward neutral; a
+  // deadband this wide absorbs one ATR-ish tick of input noise. These pair
+  // with src/lib/market/verdict-state.ts (the state machine); the smoothed-
+  // score pairs (goExit/watchExit) live there too but are mirrored here so
+  // ALGORITHM.md §17b documents every knob in one table. All ASSUMED — they
+  // are stability knobs, not edge knobs; the stability chip measures them.
+  hysteresis: {
+    goExit: 53, // GO enters ≥60 (67 flat), leaves only <53 — the deadband
+    watchExit: 42, // watch enters ≥47, leaves only <42
+    rvolExit: 1.6, // expansion gate: enter ≥2.0×, stay until <1.6×
+    buyPctLongExit: 49, // crowd gate long: enter ≥52%, stay until <49%
+    buyPctShortExit: 51, // crowd gate short: enter ≤48%, stay until >51%
+    spreadExitBps: 22, // spread gate: enter ≤15 bps, stay until >22 bps
+    residExitMult: 0.35, // momentum gate: enter >0.5×ATR bar, stay until <0.35×
+    btc1hLongExit: -0.25, // BTC 1h alignment: enter >−0.1%, stay until <−0.25%
+    btc1hShortExit: 0.25, // mirrored for shorts
+    btcRegimeDwellMs: 15_000, // a regime flip needs 15 s of persistence
+    btcRegimeAtrEnter: 0.5, // enter bull/dump at 0.5 × BTC 15m ATR
+    btcRegimeAtrExit: 0.3, // leave bull/dump only under 0.3 × ATR (deadband)
+    wallAbsentConfirmMs: 30_000, // "+8 no wall" only after 30 s of continuous absence
+    wallStaleInterpolateMs: 30_000, // full wall score until 30 s, ramp to 0 by 75 s (no cliff)
+    displayPinAfterLeaveMs: 120_000, // a row leaving GO stays pinned 2 minutes
+  },
 } as const;
 
 // ── Volatility normalization helpers ────────────────────────────────────────
@@ -375,6 +406,18 @@ export type V2Input = {
   lsRatio?: number | null; // global long/short account ratio
   listingAgeDays?: number | null; // days since first Binance candle
   historyBlocks?: number | null; // usable 5m baseline blocks (rvol trust)
+  // ── V2.2 verdict-layer additions (all optional) ──────────────────────────
+  /** The DWELLED effective BTC regime (verdict-state.ts nextBtcRegime). When
+   *  present it overrides the raw step-function mode inside the assessment —
+   *  one BTC tick can no longer flip the whole market's verdicts. */
+  btcModeOverride?: BtcMode | null;
+  /** Age of the depth snapshot this wall data came from — drives the wall
+   *  score's staleness interpolation (no more 75 s cliff). */
+  wallDataAgeMs?: number | null;
+  /** How long the ask/bid book has shown NO wall in the scan band (fresh
+   *  data) — the "+8 runway" only accrues after wallAbsentConfirmMs. */
+  askWallAbsentMs?: number | null;
+  bidWallAbsentMs?: number | null;
 };
 
 export type V2Check = {
@@ -419,26 +462,36 @@ type AxisResult = {
   warnings: string[];
 };
 
-function participationAxis(input: V2Input): { pts: number; checks: V2Check[] } {
+function participationAxis(input: V2Input, priorGo = false): { pts: number; checks: V2Check[] } {
   const tradeSpike = input.tradeSpike ?? 1;
   const rvolPts = 25 * clamp01((input.rvol - 1) / 4);
   const tradePts = 10 * clamp01((tradeSpike - 1) / 4);
   const dollarPts = 5 * clamp01(input.vol5mUsd / 200_000);
+  // V2.2 hysteresis: a GO holds its expansion through the deadband — the
+  // participation CHECK follows the gate's exit bar so the checklist can
+  // never disagree with the verdict below.
+  const rvolBar = priorGo ? V2.hysteresis.rvolExit : V2.goMinRvol;
   const checks: V2Check[] = [
     {
       label: "Participation",
-      pass: input.rvol >= V2.goMinRvol,
-      note: `${input.rvol.toFixed(2)}× volume, ${tradeSpike.toFixed(2)}× trades, ${fmtUsd(input.vol5mUsd)} in 5m → ${Math.round(rvolPts + tradePts + dollarPts)}/40`,
+      pass: input.rvol >= rvolBar,
+      note: `${input.rvol.toFixed(2)}× volume (holds ≥${V2.hysteresis.rvolExit}× once GO), ${tradeSpike.toFixed(2)}× trades, ${fmtUsd(input.vol5mUsd)} in 5m → ${Math.round(rvolPts + tradePts + dollarPts)}/40`,
     },
   ];
   return { pts: rvolPts + tradePts + dollarPts, checks };
 }
 
-function directionalAxis(input: V2Input, dir: 1 | -1): { pts: number; checks: V2Check[]; momentumPass: boolean } {
+function directionalAxis(input: V2Input, dir: 1 | -1, priorGo = false): { pts: number; checks: V2Check[]; momentumPass: boolean } {
   const atr5 = atrWindow(input.atrPct, 5);
   const atr15 = atrWindow(input.atrPct, 15);
   const bar5 = momentumBar(input.atrPct, 5);
   const bar15 = momentumBar(input.atrPct, 15);
+  // V2.2 hysteresis: the momentum GATE bar relaxes to residExitMult × the
+  // enter bar while the row is already a GO — the score itself stays raw
+  // (measurement), only the pass/fail boundary widens.
+  const exitFactor = V2.hysteresis.residExitMult / V2.momentumAtrMult;
+  const gateBar5 = priorGo ? bar5 * exitFactor : bar5;
+  const gateBar15 = priorGo ? bar15 * exitFactor : bar15;
   // Residual momentum when beta is known; raw move otherwise.
   const hasResid = typeof input.residChange5m === "number" && Number.isFinite(input.residChange5m as number);
   const eff5 = (hasResid ? (input.residChange5m as number) : input.change5m) * dir;
@@ -448,7 +501,7 @@ function directionalAxis(input: V2Input, dir: 1 | -1): { pts: number; checks: V2
   const flowPts = 10 * clamp01(((input.buyPct - 50) * dir) / 25);
   const cvd = input.cvdSlope15m ?? null;
   const cvdPts = cvd !== null ? 5 * clamp01((cvd * dir + 0.15) / 0.5) : 0;
-  const momentumPass = eff5 > bar5 && eff15 > bar15;
+  const momentumPass = eff5 > gateBar5 && eff15 > gateBar15;
   const momentumNote = hasResid
     ? `residual 5m ${eff5 >= 0 ? "+" : ""}${eff5.toFixed(2)}% / 15m ${eff15 >= 0 ? "+" : ""}${eff15.toFixed(2)}% (β ${input.beta?.toFixed(2) ?? "?"}) vs bars ${bar5.toFixed(2)}%/${bar15.toFixed(2)}%`
     : `5m ${eff5.toFixed(2)}% / 15m ${eff15.toFixed(2)}% vs ATR bars ${bar5.toFixed(2)}%/${bar15.toFixed(2)}%`;
@@ -460,8 +513,8 @@ function directionalAxis(input: V2Input, dir: 1 | -1): { pts: number; checks: V2
     },
     {
       label: "Taker flow",
-      pass: dir === 1 ? input.buyPct >= V2.goMinBuyPctLong : input.buyPct <= V2.goMinBuyPctShort,
-      note: `${input.buyPct.toFixed(0)}% buys of tape → ${Math.round(flowPts)}/10`,
+      pass: dir === 1 ? input.buyPct >= (priorGo ? V2.hysteresis.buyPctLongExit : V2.goMinBuyPctLong) : input.buyPct <= (priorGo ? V2.hysteresis.buyPctShortExit : V2.goMinBuyPctShort),
+      note: `${input.buyPct.toFixed(0)}% buys of tape${priorGo ? " (deadband holds a GO)" : ""} → ${Math.round(flowPts)}/10`,
     },
   ];
   if (cvd !== null) {
@@ -503,43 +556,72 @@ function microstructureAxis(input: V2Input, dir: 1 | -1): { pts: number; checks:
   // Now: no wall or broken wall earns a modest +8/+10; an unbreakable wall
   // (vs one-sided taker flow) costs −15; a wall that appeared seconds ago is
   // discounted as a probable spoof (half penalty) until it persists a minute.
+  //
+  // V2.2 — two flicker kills (audit Part B, step 4):
+  //   • STALENESS INTERPOLATION: the wall contribution ramps linearly from
+  //     full at wallStaleInterpolateMs (30 s) to zero at the old 75 s cutoff,
+  //     instead of cliffing. A wall swinging ±23 points the instant its depth
+  //     snapshot aged one second past 75 s was the largest single flicker
+  //     source in the old engine.
+  //   • ABSENCE CONFIRMATION: "no wall in band" earns +8 only after the book
+  //     has shown no wall for wallAbsentConfirmMs (30 s) continuously. A wall
+  //     being pulled and republished can no longer oscillate the score.
   let wallPts = 0;
   let wallUnbreakable = false;
   let wallFresh = false;
   const wall = dir === 1 ? input.askWall : input.bidWall;
-  const known = input.askWallKnown;
   const takerFlow = dir === 1 ? input.vol5mUsd * (input.buyPct / 100) : input.vol5mUsd * (1 - input.buyPct / 100);
+  const wallAgeMs = input.wallDataAgeMs ?? null;
+  const staleMs = V2.hysteresis.wallStaleInterpolateMs; // 30 s full → 75 s zero
+  const knownMaxMs = 75_000;
+  const interp = wallAgeMs === null ? 1 : wallAgeMs <= staleMs ? 1 : wallAgeMs >= knownMaxMs ? 0 : 1 - (wallAgeMs - staleMs) / (knownMaxMs - staleMs);
+  const known = input.askWallKnown && interp > 0;
   if (known && wall === null) {
-    wallPts += 8;
-    checks.push({ label: dir === 1 ? "Sell wall" : "Bid wall", pass: true, note: `no wall within band — modest runway +8` });
-  } else if (known && wall !== null) {
-    const above = dir === 1 ? input.price > wall.price : input.price < wall.price;
-    if (above) {
-      wallPts += 10;
+    const absentMs = (dir === 1 ? input.askWallAbsentMs : input.bidWallAbsentMs) ?? null;
+    if (absentMs !== null && absentMs >= V2.hysteresis.wallAbsentConfirmMs) {
+      wallPts += 8 * interp;
       checks.push({
         label: dir === 1 ? "Sell wall" : "Bid wall",
         pass: true,
-        note: `price beyond the ${fmtUsd(wall.valueUsd)} wall at ${wall.price.toPrecision(6)} +10`,
+        note: `no wall for ${Math.round(absentMs / 1000)}s — confirmed clear runway +${Math.round(8 * interp)}`,
+      });
+    } else {
+      checks.push({
+        label: dir === 1 ? "Sell wall" : "Bid wall",
+        pass: null,
+        note: `wall absent but not yet confirmed (${absentMs !== null ? `${Math.round(absentMs / 1000)}s` : "unknown"} of ${Math.round(V2.hysteresis.wallAbsentConfirmMs / 1000)}s) — no reward until it persists`,
+      });
+    }
+  } else if (known && wall !== null) {
+    const above = dir === 1 ? input.price > wall.price : input.price < wall.price;
+    if (above) {
+      wallPts += 10 * interp;
+      checks.push({
+        label: dir === 1 ? "Sell wall" : "Bid wall",
+        pass: true,
+        note: `price beyond the ${fmtUsd(wall.valueUsd)} wall at ${wall.price.toPrecision(6)} +${Math.round(10 * interp)}`,
       });
     } else {
       const age = input.wallAgeSec ?? null;
       const persistent = age !== null && age >= V2.wallFreshSec;
       wallFresh = age !== null && age < V2.wallFreshSec;
       const unbreakable = wall.valueUsd > takerFlow * V2.wallVsTaker;
-      wallUnbreakable = unbreakable && persistent;
+      // A hard-gate veto ("cannot break") needs reasonably fresh data — a
+      // half-stale wall snapshot doesn't get to demote a GO on its own.
+      wallUnbreakable = unbreakable && persistent && interp >= 0.5;
       if (unbreakable && persistent) {
-        wallPts -= 15;
+        wallPts -= 15 * interp;
         checks.push({
           label: dir === 1 ? "Sell wall" : "Bid wall",
           pass: false,
-          note: `wall ${fmtUsd(wall.valueUsd)} vs ${fmtUsd(takerFlow)} ${dir === 1 ? "taker-buy" : "taker-sell"} flow, aged ${Math.round(age ?? 0)}s — cannot break −15`,
+          note: `wall ${fmtUsd(wall.valueUsd)} vs ${fmtUsd(takerFlow)} ${dir === 1 ? "taker-buy" : "taker-sell"} flow, aged ${Math.round(age ?? 0)}s — cannot break −${Math.round(15 * interp)}`,
         });
       } else if (unbreakable && wallFresh) {
-        wallPts -= 7;
+        wallPts -= 7 * interp;
         checks.push({
           label: dir === 1 ? "Sell wall" : "Bid wall",
           pass: null,
-          note: `wall ${fmtUsd(wall.valueUsd)} vs ${fmtUsd(takerFlow)} flow but only ${Math.round(age ?? 0)}s old — half weight, possible spoof −7`,
+          note: `wall ${fmtUsd(wall.valueUsd)} vs ${fmtUsd(takerFlow)} flow but only ${Math.round(age ?? 0)}s old — half weight, possible spoof −${Math.round(7 * interp)}`,
         });
       } else {
         const depthRatio = input.wallToDepthRatio ?? null;
@@ -551,13 +633,13 @@ function microstructureAxis(input: V2Input, dir: 1 | -1): { pts: number; checks:
       }
     }
   } else {
-    checks.push({ label: dir === 1 ? "Sell wall" : "Bid wall", pass: null, note: "order book not fetched yet — no wall data" });
+    checks.push({ label: dir === 1 ? "Sell wall" : "Bid wall", pass: null, note: interp > 0 && input.askWallKnown ? "depth snapshot aging — wall score ramping down honestly" : "order book not fetched yet — no wall data" });
   }
   void atr5;
   return { pts: closePts + wallPts, checks, wallUnbreakable, wallFresh };
 }
 
-function penalties(input: V2Input, dir: 1 | -1): { pts: number; warnings: string[]; checks: V2Check[] } {
+function penalties(input: V2Input, dir: 1 | -1, priorGo = false): { pts: number; warnings: string[]; checks: V2Check[] } {
   let pts = 0;
   const warnings: string[] = [];
   const checks: V2Check[] = [];
@@ -569,7 +651,11 @@ function penalties(input: V2Input, dir: 1 | -1): { pts: number; warnings: string
   }
   const spread = input.spreadBps ?? null;
   if (spread !== null) {
-    if (spread > V2.spreadMaxBps) {
+    // V2.2 hysteresis: a GO tolerates a wider book before the spread veto
+    // fires (enter ≤15 bps, exit >22 bps) — a one-tick wide print can no
+    // longer demote a confirmed trade.
+    const spreadBar = priorGo ? V2.hysteresis.spreadExitBps : V2.spreadMaxBps;
+    if (spread > spreadBar) {
       pts -= 10;
       checks.push({ label: "Spread", pass: false, note: `${spread.toFixed(1)} bps top-of-book — exits pay the spread −10` });
     } else {
@@ -640,11 +726,11 @@ function penalties(input: V2Input, dir: 1 | -1): { pts: number; warnings: string
   return { pts, warnings, checks };
 }
 
-function axisResult(input: V2Input, dir: 1 | -1): AxisResult & { momentumPass: boolean; wallUnbreakable: boolean } {
-  const part = participationAxis(input);
-  const dirRes = directionalAxis(input, dir);
+function axisResult(input: V2Input, dir: 1 | -1, priorGo = false): AxisResult & { momentumPass: boolean; wallUnbreakable: boolean } {
+  const part = participationAxis(input, priorGo);
+  const dirRes = directionalAxis(input, dir, priorGo);
   const micro = microstructureAxis(input, dir);
-  const pen = penalties(input, dir);
+  const pen = penalties(input, dir, priorGo);
   return {
     participation: part.pts,
     directional: dirRes.pts,
@@ -660,11 +746,18 @@ function axisResult(input: V2Input, dir: 1 | -1): AxisResult & { momentumPass: b
  *  (the user's own backtest) calibration; the shipped measured default stands
  *  in otherwise. `opts.replay` disables the expectancy gate — the backtest is
  *  the calibration instrument and must measure the raw signal without the
- *  meta-gate, or it could never recalibrate the live one. */
-export function assessLong(input: V2Input, cal?: Calibration | null, opts?: { replay?: boolean }): SideAssessment {
-  const axes = axisResult(input, 1);
+ *  meta-gate, or it could never recalibrate the live one. `opts.priorGo`
+ *  (V2.2) relaxes the gate boundaries to their exit thresholds while the
+ *  pair's verdict state is a GO — hysteresis lives in the gates too, not
+ *  only in the state machine. */
+export function assessLong(input: V2Input, cal?: Calibration | null, opts?: { replay?: boolean; priorGo?: boolean }): SideAssessment {
+  const priorGo = opts?.priorGo === true;
+  const axes = axisResult(input, 1, priorGo);
   const score = axes.participation + axes.directional + axes.microstructure;
-  const mode = btcModeFor(input.btcChange15m, input.btcAtr15m);
+  // V2.2: the DWELLED regime (verdict-state.ts nextBtcRegime) overrides the
+  // raw step function when the tier supplies it — one BTC tick can no longer
+  // flip every verdict in the market.
+  const mode = input.btcModeOverride ?? btcModeFor(input.btcChange15m, input.btcAtr15m);
   const threshold = mode === "flat" ? V2.goScoreFlat : V2.goScore;
 
   let verdict: SideVerdict;
@@ -748,15 +841,25 @@ export function assessLong(input: V2Input, cal?: Calibration | null, opts?: { re
     ]);
     gates.push([input.vol5mUsd > V2.volLowUsd, "volume", `Low money — ${fmtUsd(input.vol5mUsd)} in 5m`]);
     gates.push([input.trades5m >= V2.tradesLow, "liquidity", `Too thin — ${input.trades5m} trades`]);
-    gates.push([input.rvol >= V2.goMinRvol, "expansion", `No volume expansion (${input.rvol.toFixed(2)}×)`]);
-    gates.push([input.buyPct >= V2.goMinBuyPctLong, "crowd", `Buyers only ${input.buyPct.toFixed(0)}% of tape`]);
+    // V2.2: expansion + crowd + btc1h gates get the exit (deadband) bar while
+    // the row is already a GO — 2.0×/1.6×, 52%/49%, −0.1%/−0.25%.
     gates.push([
-      input.btcChange1h === null || input.btcChange1h > -0.1,
+      input.rvol >= (priorGo ? V2.hysteresis.rvolExit : V2.goMinRvol),
+      "expansion",
+      `Volume expansion fading (${input.rvol.toFixed(2)}× vs the ${priorGo ? V2.hysteresis.rvolExit : V2.goMinRvol}× hold bar)`,
+    ]);
+    gates.push([
+      input.buyPct >= (priorGo ? V2.hysteresis.buyPctLongExit : V2.goMinBuyPctLong),
+      "crowd",
+      `Buyers only ${input.buyPct.toFixed(0)}% of tape`,
+    ]);
+    gates.push([
+      input.btcChange1h === null || input.btcChange1h > (priorGo ? V2.hysteresis.btc1hLongExit : -0.1),
       "btc1h",
       `BTC 1h ${input.btcChange1h?.toFixed(2)}% falling — bull-trap risk`,
     ]);
     const spread = input.spreadBps ?? null;
-    gates.push([spread === null || spread <= V2.spreadMaxBps, "spread", spread !== null ? `Spread ${spread.toFixed(1)} bps — too wide to exit honestly` : ""]);
+    gates.push([spread === null || spread <= (priorGo ? V2.hysteresis.spreadExitBps : V2.spreadMaxBps), "spread", spread !== null ? `Spread ${spread.toFixed(1)} bps — too wide to exit honestly` : ""]);
     gates.push([!trade.blocked, "plan", trade.blockReason ?? ""]);
     gates.push([
       !(axes.wallUnbreakable && input.askWall !== null && input.price < input.askWall.price),
@@ -788,11 +891,14 @@ export function assessLong(input: V2Input, cal?: Calibration | null, opts?: { re
   };
 }
 
-/** SHORT side — mirrored filters with its own calibration. */
-export function assessShort(input: V2Input, cal?: Calibration | null, opts?: { replay?: boolean }): SideAssessment {
-  const axes = axisResult(input, -1);
+/** SHORT side — mirrored filters with its own calibration. `opts.priorGo`
+ *  mirrors the long-side hysteresis (deadband gates while the short state
+ *  is a GO). */
+export function assessShort(input: V2Input, cal?: Calibration | null, opts?: { replay?: boolean; priorGo?: boolean }): SideAssessment {
+  const priorGo = opts?.priorGo === true;
+  const axes = axisResult(input, -1, priorGo);
   const score = axes.participation + axes.directional + axes.microstructure;
-  const mode = btcModeFor(input.btcChange15m, input.btcAtr15m);
+  const mode = input.btcModeOverride ?? btcModeFor(input.btcChange15m, input.btcAtr15m);
 
   let verdict: SideVerdict;
   if (mode === "bull") {
@@ -856,11 +962,23 @@ export function assessShort(input: V2Input, cal?: Calibration | null, opts?: { r
     ]);
     gates.push([input.vol5mUsd > V2.volLowUsd, "volume", `Low money — ${fmtUsd(input.vol5mUsd)} in 5m`]);
     gates.push([input.trades5m >= V2.tradesLow, "liquidity", `Too thin — ${input.trades5m} trades`]);
-    gates.push([input.rvol >= V2.goMinRvol, "expansion", `No volume expansion (${input.rvol.toFixed(2)}×)`]);
-    gates.push([input.buyPct <= V2.goMinBuyPctShort, "crowd", `Sellers only ${(100 - input.buyPct).toFixed(0)}% of tape`]);
-    gates.push([input.btcChange1h === null || input.btcChange1h < 0.1, "btc1h", `BTC 1h ${input.btcChange1h?.toFixed(2)}% rising — dip gets bought`]);
+    gates.push([
+      input.rvol >= (priorGo ? V2.hysteresis.rvolExit : V2.goMinRvol),
+      "expansion",
+      `Volume expansion fading (${input.rvol.toFixed(2)}× vs the ${priorGo ? V2.hysteresis.rvolExit : V2.goMinRvol}× hold bar)`,
+    ]);
+    gates.push([
+      input.buyPct <= (priorGo ? V2.hysteresis.buyPctShortExit : V2.goMinBuyPctShort),
+      "crowd",
+      `Sellers only ${(100 - input.buyPct).toFixed(0)}% of tape`,
+    ]);
+    gates.push([
+      input.btcChange1h === null || input.btcChange1h < (priorGo ? V2.hysteresis.btc1hShortExit : 0.1),
+      "btc1h",
+      `BTC 1h ${input.btcChange1h?.toFixed(2)}% rising — dip gets bought`,
+    ]);
     const spread = input.spreadBps ?? null;
-    gates.push([spread === null || spread <= V2.spreadMaxBps, "spread", spread !== null ? `Spread ${spread.toFixed(1)} bps — too wide` : ""]);
+    gates.push([spread === null || spread <= (priorGo ? V2.hysteresis.spreadExitBps : V2.spreadMaxBps), "spread", spread !== null ? `Spread ${spread.toFixed(1)} bps — too wide` : ""]);
     gates.push([!trade.blocked, "plan", trade.blockReason ?? ""]);
     gates.push([
       !(axes.wallUnbreakable && input.bidWall !== null && input.price > input.bidWall.price),
@@ -975,14 +1093,40 @@ export type RowV2 = {
   futures?: { oiChange15m: number | null; fundingRatePct: number | null; lsRatio: number | null };
   longDemoteGate?: string | null; // first gate vetoing a would-be long GO (shadow logging)
   shortDemoteGate?: string | null;
+  // ── V2.2 — the stateful verdict layer (mirrors RadarRowV2 in types.ts).
+  state?: import("./types").RadarVerdictState | null; // long-side verdict state
+  shortState?: import("./types").RadarVerdictState | null;
+  rawVerdict?: RowVerdict; // the stateless assessment's verdict (diagnostics)
+  wouldBeGo?: boolean; // state GO, expectancy gate holds the fire
+  expectancyNote?: string | null;
+  dataAgeMs?: number | null;
 };
 
-export function assessRow(input: V2Input, cal?: Calibration | null): RowV2 {
+export function assessRow(
+  input: V2Input,
+  cal?: Calibration | null,
+  opts?: { priorLongGo?: boolean; priorShortGo?: boolean },
+): RowV2 {
+  return assessRowWithSides(input, cal, opts).row;
+}
+
+/** V2.2 — the tiers' entry point: the combined row PLUS the raw per-side
+ *  assessments, because the stateful verdict layer (verdict-state.ts) advances
+ *  on the SIDE assessments (verdict/demoteGate/score), while the wire payload
+ *  only needs the combined row. */
+export function assessRowWithSides(
+  input: V2Input,
+  cal?: Calibration | null,
+  opts?: { priorLongGo?: boolean; priorShortGo?: boolean },
+): { row: RowV2; long: SideAssessment; short: SideAssessment } {
   // The user's calibration (from their own backtest) wins; the shipped
   // measured default stands in otherwise — the row always carries a hit-rate
   // label and the expectancy gate always has numbers to work with.
-  const long = assessLong(input, cal);
-  const short = assessShort(input, cal);
+  // V2.2: priorLongGo/priorShortGo carry the pair's verdict STATE into the
+  // assessment so the hard gates run their exit (deadband) thresholds while
+  // the state is a GO — hysteresis at the gate level too.
+  const long = assessLong(input, cal, { priorGo: opts?.priorLongGo });
+  const short = assessShort(input, cal, { priorGo: opts?.priorShortGo });
   const effectiveHitRate = lookupHitRate(cal ?? DEFAULT_CALIBRATION, Math.round(long.score));
   const scenarios = buildScenarios(input, long, short, effectiveHitRate);
 
@@ -997,7 +1141,7 @@ export function assessRow(input: V2Input, cal?: Calibration | null): RowV2 {
   const w = input.askWall;
   const bid = input.bidWall;
 
-  return {
+  const row: RowV2 = {
     longScore: Math.round(long.score),
     shortScore: Math.round(short.score),
     verdict,
@@ -1030,7 +1174,9 @@ export function assessRow(input: V2Input, cal?: Calibration | null): RowV2 {
         : undefined,
     longDemoteGate: long.demoteGate,
     shortDemoteGate: short.demoteGate,
+    rawVerdict: verdict,
   };
+  return { row, long, short };
 }
 
 // ── Cooldown ledger — stop the flip-flop ─────────────────────────────────────
@@ -1083,6 +1229,20 @@ export class CooldownLedger {
   resetBlocks(): void {
     this.longBlocked.clear();
     this.shortBlocked.clear();
+  }
+
+  /** V2.2 (audit Part B step 3): a regime flip now SHORTENS directional
+   *  blocks to at most `maxRemainingMs` instead of clearing them — the
+   *  blocked pairs re-enter the candidate pool gradually over the next few
+   *  minutes, not all at once (the flip itself is already dwell-stabilised,
+   *  so the burst amplifier is gone twice over). */
+  shortenDirectional(maxRemainingMs: number, now = Date.now()): void {
+    for (const [pair, until] of this.longBlocked) {
+      if (until - now > maxRemainingMs) this.longBlocked.set(pair, now + maxRemainingMs);
+    }
+    for (const [pair, until] of this.shortBlocked) {
+      if (until - now > maxRemainingMs) this.shortBlocked.set(pair, now + maxRemainingMs);
+    }
   }
 }
 
@@ -1202,15 +1362,55 @@ export function buildCalibration(trades: BacktestTrade[], days: number, coins: n
   return { updatedAt: new Date().toISOString(), days, coins, bins };
 }
 
-/** Lookup the empirical hit rate for an uncapped score (needs n ≥ 30). */
+/** Lookup the empirical hit rate for an uncapped score (needs n ≥ 30).
+ *  V2.2 — CONTINUOUS: p is linearly interpolated between band MIDPOINTS over
+ *  a monotone (isotonic, PAV) fit of the binned rates, so a pair at 79.9 and
+ *  one at 80.1 can no longer straddle a 0.12 jump in p — the score is
+ *  continuous and the gate's input now is too (audit Part B step 5). */
 export function lookupHitRate(cal: Calibration | null | undefined, score: number): { p: number; n: number } | null {
   if (!cal || cal.bins.length === 0) return null;
-  let best: CalibrationBin | null = null;
-  for (const b of cal.bins) {
-    if (score >= b.scoreMin && b.n >= 30 && (best === null || b.scoreMin > best.scoreMin)) best = b;
+  const usable = cal.bins.filter((b) => b.n >= 30).sort((a, b) => a.scoreMin - b.scoreMin);
+  if (usable.length === 0) return null;
+  if (usable.length === 1) return { p: usable[0].hitRate, n: usable[0].decided };
+
+  // Band midpoints: bin i's representative score is the centre of
+  // [scoreMin, next.scoreMin); the last bin gets a nominal +10 width.
+  const midpoints = usable.map((b, i) => {
+    const width = i + 1 < usable.length ? usable[i + 1].scoreMin - b.scoreMin : 10;
+    return b.scoreMin + width / 2;
+  });
+  // Monotone fit (pool-adjacent-violators, weighted by decided counts):
+  // a higher score band can never imply a lower hit rate.
+  const raw = usable.map((b) => b.hitRate);
+  const weights = usable.map((b) => Math.max(1, b.decided));
+  const ps: number[] = [];
+  const blocks: { sum: number; w: number; count: number }[] = [];
+  for (let k = 0; k < raw.length; k += 1) {
+    blocks.push({ sum: raw[k] * weights[k], w: weights[k], count: 1 });
+    while (blocks.length > 1) {
+      const a = blocks[blocks.length - 2];
+      const b = blocks[blocks.length - 1];
+      if (a.sum / a.w > b.sum / b.w + 1e-12) {
+        blocks.splice(blocks.length - 2, 2, { sum: a.sum + b.sum, w: a.w + b.w, count: a.count + b.count });
+      } else break;
+    }
   }
-  if (!best) return null;
-  return { p: best.hitRate, n: best.decided };
+  for (const blk of blocks) {
+    const val = blk.sum / blk.w;
+    for (let k = 0; k < blk.count; k += 1) ps.push(val);
+  }
+
+  if (score <= midpoints[0]) return { p: ps[0], n: usable[0].decided };
+  const last = usable.length - 1;
+  if (score >= midpoints[last]) return { p: ps[last], n: usable[last].decided };
+  for (let i = 0; i < last; i += 1) {
+    if (score >= midpoints[i] && score <= midpoints[i + 1]) {
+      const t = (score - midpoints[i]) / (midpoints[i + 1] - midpoints[i]);
+      const p = ps[i] + t * (ps[i + 1] - ps[i]);
+      return { p, n: t < 0.5 ? usable[i].decided : usable[i + 1].decided };
+    }
+  }
+  return { p: ps[last], n: usable[last].decided };
 }
 
 // ── The measured default calibration ─────────────────────────────────────────
@@ -1372,6 +1572,17 @@ export function backtestSymbol(
 
   const ledger = new CooldownLedger();
   const atrCaches = new Map<number, number | null>();
+
+  // V2.2 — the stateful verdict layer, driven at bar close exactly like the
+  // live tiers drive it at scan close (audit Part B.8): calibrate on the
+  // state machine's GO transitions, not the raw score threshold, because
+  // the live system trades the state machine. If the live verdict and the
+  // replay verdict came from different code, that would re-create the
+  // audit's central complaint.
+  let longState: VerdictState | null = null;
+  let shortState: VerdictState | null = null;
+  let btcRegime: BtcRegimeState | null = null;
+  const replayCfg = replayVerdictConfig();
 
   // Rolling ATR on 5m bars → estimated 1m ATR via √time scaling.
   const atrAt = (i: number): number | null => {
@@ -1669,10 +1880,30 @@ export function backtestSymbol(
     };
 
     const now = bar.t;
+    // V2.2 — the DWELLED BTC regime (ATR deadband + dwell), shared with the
+    // live tiers. A BTC tick can no longer flip the replay's whole market.
+    const prevRegimeMode = btcRegime?.mode ?? null;
+    btcRegime = nextBtcRegime(btcRegime, btcChange15m, input.btcAtr15m, bar.t);
+    if (prevRegimeMode !== null && prevRegimeMode !== btcRegime.mode) {
+      // Regime flip: SHORTEN directional blocks (10 min cap), don't clear —
+      // the blocked pairs re-enter gradually, not as one burst.
+      ledger.shortenDirectional(10 * 60_000, now);
+    }
+    input.btcModeOverride = btcRegime.mode;
+
     // Replay mode: the expectancy gate is OFF in backtests — the replay IS the
     // calibration instrument and must measure the raw signal + classic gates.
-    const long = assessLong(input, null, { replay: true });
-    const short = assessShort(input, null, { replay: true });
+    // The gates themselves run their deadband thresholds while the pair's
+    // verdict state is a GO (same as live).
+    const priorLongGo = longState?.name === "go" || longState?.name === "demoting";
+    const priorShortGo = shortState?.name === "go" || shortState?.name === "demoting";
+    const long = assessLong(input, null, { replay: true, priorGo: priorLongGo });
+    const short = assessShort(input, null, { replay: true, priorGo: priorShortGo });
+
+    // The stateful verdict layer at bar close — the same reducer the live
+    // tiers run at scan close, with the bar-scaled replay config.
+    const longNext = nextVerdictState(longState, "long", long, btcRegime.mode, bar.t, 0, replayCfg, stable);
+    const shortNext = nextVerdictState(shortState, "short", short, btcRegime.mode, bar.t, 0, replayCfg, stable);
 
     // Shadow log: every would-be GO that a gate (or the ledger) vetoed, graded
     // as if it had fired — the only way to know whether a gate helps or hurts.
@@ -1685,7 +1916,12 @@ export function backtestSymbol(
       if (t) shadow.push({ pair, side: "short", gate: short.demoteGate, time: bar.t, outcome: t.outcome, pnlNetPct: t.pnlNetPct });
     }
 
-    if (long.verdict === "go") {
+    // A GO fires on the state machine's TRANSITION into "go" — confirmed,
+    // dwelled, hysteresis-held — exactly like the live tiers. The trade's
+    // score is the SMOOTHED score the state machine actually acted on, so the
+    // calibration bins map what the live system ranks by.
+    const longFired = longNext.name === "go" && longState?.name !== "go";
+    if (longFired) {
       if (!ledger.longAllowed(pair, now)) {
         const t = grade("long", i);
         if (t) shadow.push({ pair, side: "long", gate: "cooldown", time: bar.t, outcome: t.outcome, pnlNetPct: t.pnlNetPct });
@@ -1695,14 +1931,15 @@ export function backtestSymbol(
       } else {
         const trade = grade("long", i);
         if (trade) {
-          trade.score = long.score;
+          trade.score = Math.round(longNext.scoreSmooth);
           longs.push(trade);
           ledger.longSignal(pair, now);
           if (trade.outcome === "loss") ledger.bearishSignal(pair, trade.exitTime ?? now);
         }
       }
     }
-    if (short.verdict === "go") {
+    const shortFired = shortNext.name === "go" && shortState?.name !== "go";
+    if (shortFired) {
       if (!ledger.shortAllowed(pair, now)) {
         const t = grade("short", i);
         if (t) shadow.push({ pair, side: "short", gate: "cooldown", time: bar.t, outcome: t.outcome, pnlNetPct: t.pnlNetPct });
@@ -1712,12 +1949,15 @@ export function backtestSymbol(
       } else {
         const trade = grade("short", i);
         if (trade) {
-          trade.score = short.score;
+          trade.score = Math.round(shortNext.scoreSmooth);
           shorts.push(trade);
           ledger.shortSignal(pair, now);
         }
       }
     }
+
+    longState = longNext;
+    shortState = shortNext;
   }
 
   return { longs, shorts, shadow };
@@ -1826,6 +2066,11 @@ export function rowInputFromRadar(
     lsRatio?: number | null;
     listingAgeDays?: number | null;
     historyBlocks?: number | null;
+    // V2.2 verdict-layer feeds.
+    btcModeOverride?: BtcMode | null;
+    wallDataAgeMs?: number | null;
+    askWallAbsentMs?: number | null;
+    bidWallAbsentMs?: number | null;
   },
 ): V2Input {
   return {
@@ -1866,5 +2111,9 @@ export function rowInputFromRadar(
     listingAgeDays: extras.listingAgeDays ?? null,
     historyBlocks: extras.historyBlocks ?? null,
     isStablecoin: extras.isStablecoin ?? stablecoinLike(row.price, row.change15m, row.change24h),
+    btcModeOverride: extras.btcModeOverride ?? null,
+    wallDataAgeMs: extras.wallDataAgeMs ?? null,
+    askWallAbsentMs: extras.askWallAbsentMs ?? null,
+    bidWallAbsentMs: extras.bidWallAbsentMs ?? null,
   };
 }

@@ -41,15 +41,28 @@ import {
   CooldownLedger,
   PortfolioGuard,
   V2,
-  assessRow,
+  assessRowWithSides,
   atrPctFromCandles,
   atrWindow,
-  btcModeFor,
   rowInputFromRadar,
   stablecoinLike,
   type Calibration,
   type V2Wall,
 } from "./v2-engine";
+import {
+  deserializeVerdictStates,
+  liveVerdictConfig,
+  nextBtcRegime,
+  nextVerdictState,
+  overlayVerdictState,
+  persistVerdictStates,
+  stabilityStats,
+  verdictSortRank,
+  type BtcRegimeState,
+  type VerdictChangeEntry,
+  type VerdictConfig,
+  type VerdictState,
+} from "./verdict-state";
 import {
   analyzeDepth,
   anomalyScore,
@@ -77,7 +90,9 @@ const UNIVERSE_POOL = 100; // candidates that earn the batched trade-count fetch
 const UNIVERSE_MIN_QUOTE_VOL = 2_000_000; // §2.2 hard liquidity floor
 const UNIVERSE_MIN_TRADE_COUNT = 5_000; // §2.2 thin-tape floor
 const UNIVERSE_REFRESH_MS = 5 * 60_000;
-const COMPUTE_INTERVAL_MS = 1_000;
+const COMPUTE_INTERVAL_MS = 1_000; // price/display cadence — the verdict tick runs every 3rd compute (3 s)
+const VERDICT_EVERY_N_COMPUTES = 3; // V2.2 — audit Part B.5: decouple display from verdict cadence
+const VERDICT_STATE_SAVE_MS = 30_000; // V2.2 — persist dwell/pin timers across reloads
 const KLINE_LIMIT = 288; // §2.3 — 24h of 1m candles, same request-weight class
 const SIGNAL_COOLDOWN_MS = 10 * 60_000;
 const MAX_SIGNALS_PER_SCAN = 6;
@@ -469,6 +484,17 @@ class LocalRadarEngine {
   private guard = new PortfolioGuard(); // §5.2 — concurrency / correlation / kill switch
   private calibration: Calibration | null = null; // §8 — from the Backtest UI
   private lastBtcMode: string | null = null; // §13 — regime-flip detector
+  // ── V2.2 — the stateful verdict layer (audit Part B) ──────────────────────
+  private verdictLongStates = new Map<string, VerdictState>();
+  private verdictShortStates = new Map<string, VerdictState>();
+  private btcRegime: BtcRegimeState | null = null;
+  private verdictChangeLog: VerdictChangeEntry[] = []; // newest first, bounded
+  private lastTapeMs = new Map<string, number>(); // aggTrade/bucket freshness per pair
+  private askAbsentSince = new Map<string, number>(); // wall-absence confirmation
+  private bidAbsentSince = new Map<string, number>();
+  private computeTick = 0;
+  private stateSaveAt = 0;
+  private liveCfg: VerdictConfig = liveVerdictConfig();
   private dirtyOutcomes: MarketSignal[] = [];
   private walls = new Map<string, WallEntry>();
   private wallTracks = new Map<string, WallTrack>(); // §4 — wall persistence
@@ -529,6 +555,14 @@ class LocalRadarEngine {
     if (this.running || typeof window === "undefined") return;
     this.running = true;
     this.loadCalibration(); // §8 — calibrated from the very first scan
+    // V2.2 — restore the verdict states so a reload never resets every dwell
+    // timer (a GO that was 40 s into its dwell stays a GO, not a newborn).
+    const restored = deserializeVerdictStates();
+    if (restored) {
+      this.verdictLongStates = restored.longs;
+      this.verdictShortStates = restored.shorts;
+      this.btcRegime = restored.regime;
+    }
     // Reload the tracked signals from the local log (they keep grading across
     // page reloads — same accountability the server scanner has).
     this.tracked = readLocalSignals()
@@ -683,6 +717,9 @@ class LocalRadarEngine {
 
   private applyAggTrade(pair: string, price: number, qty: number, buyerIsMaker: boolean) {
     if (price <= 0 || qty < 0) return;
+    // V2.2 — the per-pair tape freshness clock: the verdict's data-age freeze
+    // reads exactly this (buckets ARE the verdict inputs).
+    this.lastTapeMs.set(pair, Date.now());
     let buckets = this.buckets.get(pair);
     if (!buckets) {
       buckets = new Map();
@@ -1521,6 +1558,22 @@ class LocalRadarEngine {
     return false;
   }
 
+  /** V2.2 — wall-absence confirmation: how long has the book shown NO wall in
+   *  the scan band on this side? The "+8 runway" accrues only after 30 s of
+   *  continuous fresh absence — pulled-and-republished walls can't oscillate. */
+  private trackWallAbsence(map: Map<string, number>, pair: string, known: boolean, wall: V2Wall, nowMs: number): number | null {
+    if (known && wall === null) {
+      const since = map.get(pair);
+      if (since === undefined) {
+        map.set(pair, nowMs);
+        return 0;
+      }
+      return nowMs - since;
+    }
+    map.delete(pair); // wall reappeared, data went stale, or never known
+    return null;
+  }
+
   /** Pairs worth extra REST attention (walls + futures): GO/watch candidates
    *  and anything scoring like one, plus the coin-sheet subscriptions. */
   private restCandidates(rows: RadarRow[]): string[] {
@@ -1639,9 +1692,16 @@ class LocalRadarEngine {
   }
 
   // ── The compute tick — pure computation over the live stores ────────────────
+  //
+  // V2.2 (audit Part B.5): the 1 s tick stays for PRICE display; the VERDICT
+  // advances only every 3rd tick (3 s) through the stateful layer, and the
+  // emitted verdict is always the state machine's — never the raw snapshot's.
 
   private compute() {
     if (!this.running) return;
+    this.computeTick += 1;
+    const verdictTick = this.computeTick % VERDICT_EVERY_N_COMPUTES === 0;
+    const nowMs = Date.now();
     const pairs = [...new Set([...this.universe, ...this.extraPairs])];
     const rows: RadarRow[] = [];
     const prices = new Map<string, number>();
@@ -1655,12 +1715,14 @@ class LocalRadarEngine {
     }
     if (rows.length === 0) return;
 
-    rows.sort((a, b) => b.score - a.score || b.rvol - a.rvol);
-
-    // BTC market regime — the filter every V2 verdict runs through. §3.4: the
-    // bull/dump bar is 0.5 × BTC's OWN 15m ATR (floored at the legacy ±0.3%).
+    // BTC market regime — V2.2: DWELLED with an ATR deadband (0.5 × enter,
+    // 0.3 × exit, 15 s persistence). One BTC tick can no longer flip every
+    // verdict in the market, and a flip now SHORTENS directional blocks to
+    // ≤10 min instead of clearing them (the burst amplifier, twice dead).
     const btcRow = rows.find((r) => r.pair === "BTCUSDT") ?? null;
     const btcAtr15m = atrWindow(btcRow?.atrPct ?? null, 15);
+    const prevRegimeMode = this.btcRegime?.mode ?? null;
+    this.btcRegime = nextBtcRegime(this.btcRegime, btcRow?.change15m ?? null, btcAtr15m, nowMs);
     if (btcRow) {
       const spark0 = btcRow.spark[0] ?? btcRow.price;
       this.btcContext = {
@@ -1669,22 +1731,35 @@ class LocalRadarEngine {
         change15m: btcRow.change15m,
         change1h: spark0 > 0 ? ((btcRow.price - spark0) / spark0) * 100 : 0,
         change24h: btcRow.change24h,
-        mode: btcModeFor(btcRow.change15m, btcAtr15m) ?? "flat",
+        mode: this.btcRegime.mode,
       };
-      // §10/§13 — a regime flip voids directional blocks earned in the old
-      // regime (a bearish block from a dump must not persist into a bull
-      // flip); repeat dampers survive inside the ledger.
-      if (this.lastBtcMode !== null && this.lastBtcMode !== this.btcContext.mode) this.ledger.resetBlocks();
-      this.lastBtcMode = this.btcContext.mode;
+      if (prevRegimeMode !== null && prevRegimeMode !== this.btcRegime.mode) {
+        this.ledger.shortenDirectional(10 * 60_000, nowMs);
+      }
+      this.lastBtcMode = this.btcRegime.mode;
     }
 
     // V2 assessment on every row; wall/futures/flow data where the paced
     // queues have reached. rowInputFromRadar is the SAME adapter the server
     // scanner feeds — one input contract, two tiers, zero drift.
-    rows.forEach((row, index) => {
+    for (const row of rows) {
       const wall = this.wallSnapshot(row.pair);
       const flow = this.flowExtras(row);
       const fut = this.freshFutures(row.pair);
+      // V2.2 — depth age + wall-absence confirmation clocks.
+      const cachedWall = this.walls.get(row.pair);
+      const wallDataAgeMs = cachedWall !== undefined ? Math.max(0, nowMs - cachedWall.at) : null;
+      const askAbsentMs = this.trackWallAbsence(this.askAbsentSince, row.pair, wall.known, wall.ask, nowMs);
+      const bidAbsentMs = this.trackWallAbsence(this.bidAbsentSince, row.pair, wall.known, wall.bid, nowMs);
+      // V2.2 — data age: the stalest verdict input (tape/buckets, and the
+      // depth snapshot when one exists). Transitions freeze past 3× cadence.
+      const tapeAge = this.lastTapeMs.has(row.pair) ? Math.max(0, nowMs - (this.lastTapeMs.get(row.pair) ?? nowMs)) : 0;
+      const dataAgeMs = Math.max(tapeAge, wallDataAgeMs ?? 0);
+      const isStable = isStableAsset(row.base, row.price, row.change15m, row.change24h);
+      const priorLong = this.verdictLongStates.get(row.pair) ?? null;
+      const priorShort = this.verdictShortStates.get(row.pair) ?? null;
+      const priorLongGo = priorLong?.name === "go" || priorLong?.name === "demoting";
+      const priorShortGo = priorShort?.name === "go" || priorShort?.name === "demoting";
       const input = rowInputFromRadar(row, {
         atrPct: row.atrPct,
         askWall: wall.ask,
@@ -1693,7 +1768,7 @@ class LocalRadarEngine {
         wallBrokenConfirmed: this.wallBreakState(row.pair, row.price, wall.ask),
         btcChange15m: this.btcContext?.change15m ?? null,
         btcChange1h: this.btcContext?.change1h ?? null,
-        isStablecoin: isStableAsset(row.base, row.price, row.change15m, row.change24h),
+        isStablecoin: isStable,
         // §3.4 — beta + residual momentum (BTC anchors the tape).
         beta: flow.beta,
         residChange5m: flow.residChange5m,
@@ -1715,15 +1790,87 @@ class LocalRadarEngine {
         // §4/§2.3 — listing age + baseline-trust blocks.
         listingAgeDays: listingAgeDays(this.firstCandleMs.get(row.pair)),
         historyBlocks: this.historyBlocksByPair.get(row.pair) ?? null,
+        // V2.2 — the verdict-layer feeds.
+        btcModeOverride: this.btcRegime.mode,
+        wallDataAgeMs,
+        askWallAbsentMs: askAbsentMs,
+        bidWallAbsentMs: bidAbsentMs,
       });
-      const v2 = assessRow(input, this.calibration);
+      const { row: v2, long: longAssess, short: shortAssess } = assessRowWithSides(input, this.calibration, {
+        priorLongGo,
+        priorShortGo,
+      });
       // §8 — the engine fills hitRate from the user's calibration (or the
       // shipped measured default) and the expectancy gate reads the same
       // numbers, so the label and the verdict can never disagree.
       // §6 — live shadow log: every would-be GO the hard gates vetoed still
       // gets logged and graded, so the gates themselves stay accountable.
-      if (v2.longVerdict === "watch" && v2.longDemoteGate) this.logShadow(row.pair, "long", v2.longDemoteGate, row.price);
-      if (v2.shortVerdict === "watch" && v2.shortDemoteGate) this.logShadow(row.pair, "short", v2.shortDemoteGate, row.price);
+      // (Read from the RAW assessment — before the state overlay.)
+      if (longAssess.verdict === "watch" && longAssess.demoteGate) this.logShadow(row.pair, "long", longAssess.demoteGate, row.price);
+      if (shortAssess.verdict === "watch" && shortAssess.demoteGate) this.logShadow(row.pair, "short", shortAssess.demoteGate, row.price);
+      // V2.2 — advance the state machines on the 3 s verdict tick only.
+      let longState = priorLong;
+      let shortState = priorShort;
+      if (verdictTick) {
+        longState = nextVerdictState(priorLong, "long", longAssess, this.btcRegime.mode, nowMs, dataAgeMs, this.liveCfg, isStable || this.guard.killed(nowMs));
+        shortState = nextVerdictState(priorShort, "short", shortAssess, this.btcRegime.mode, nowMs, dataAgeMs, this.liveCfg, isStable || this.guard.killed(nowMs));
+        this.verdictLongStates.set(row.pair, longState);
+        this.verdictShortStates.set(row.pair, shortState);
+        if (longState.name !== (priorLong?.name ?? "inactive")) {
+          this.verdictChangeLog.unshift({
+            pair: row.pair,
+            side: "long",
+            at: nowMs,
+            from: priorLong?.name ?? "inactive",
+            to: longState.name,
+            scoreSmooth: longState.scoreSmooth,
+            rawScore: v2.longScore,
+            dataAgeMs,
+            firstFailingGate: longAssess.demoteGate,
+            reason: longState.lastChangeReason,
+          });
+          if (this.verdictChangeLog.length > 300) this.verdictChangeLog.length = 300;
+        }
+        if (shortState.name !== (priorShort?.name ?? "inactive")) {
+          this.verdictChangeLog.unshift({
+            pair: row.pair,
+            side: "short",
+            at: nowMs,
+            from: priorShort?.name ?? "inactive",
+            to: shortState.name,
+            scoreSmooth: shortState.scoreSmooth,
+            rawScore: v2.shortScore,
+            dataAgeMs,
+            firstFailingGate: shortAssess.demoteGate,
+            reason: shortState.lastChangeReason,
+          });
+          if (this.verdictChangeLog.length > 300) this.verdictChangeLog.length = 300;
+        }
+      }
+      // The overlay runs EVERY tick: the emitted verdict is always the state
+      // machine's (held between verdict ticks), never the raw snapshot's.
+      if (longState && shortState) {
+        overlayVerdictState(v2, longAssess, shortAssess, longState, shortState, this.liveCfg, isStable);
+      }
+      v2.dataAgeMs = dataAgeMs;
+      row.v2 = v2;
+    }
+
+    // V2.2 — pinned emission order: GO states first, pinned recent exits
+    // second, then the rest by smoothed score. A visible coin can no longer
+    // be bumped out of sight by a new candidate.
+    rows.sort((a, b) => {
+      const rankA = verdictSortRank(a.v2?.state ?? a.v2?.shortState ?? null, nowMs);
+      const rankB = verdictSortRank(b.v2?.state ?? b.v2?.shortState ?? null, nowMs);
+      if (rankA !== rankB) return rankA - rankB;
+      const scoreA = a.v2?.state?.scoreSmooth ?? a.v2?.longScore ?? a.score;
+      const scoreB = b.v2?.state?.scoreSmooth ?? b.v2?.longScore ?? b.score;
+      return scoreB - scoreA || b.rvol - a.rvol;
+    });
+    // Keep the payload sane: full detail for the top 20 + subscribed pairs.
+    rows.forEach((row, index) => {
+      const v2 = row.v2;
+      if (!v2) return;
       if (index > 20 && !this.extraPairs.has(row.pair)) {
         v2.checks = [];
         v2.shortChecks = [];
@@ -1731,7 +1878,6 @@ class LocalRadarEngine {
         v2.trade = null;
         v2.shortTrade = null;
       }
-      row.v2 = v2;
     });
 
     this.pumpWallQueue(rows);
@@ -1745,9 +1891,16 @@ class LocalRadarEngine {
       scans: this.scans,
       stale: this.isStale(),
       btc: this.btcContext,
+      stability: stabilityStats(this.verdictChangeLog, nowMs, { cadenceMs: this.liveCfg.scanCadenceMs }),
     };
     this.lastSnapshot = snapshot;
     this.listeners.onSnapshot?.(snapshot);
+
+    // V2.2 — persist the verdict states (dwell/pin timers survive reloads).
+    if (verdictTick && nowMs - this.stateSaveAt >= VERDICT_STATE_SAVE_MS) {
+      this.stateSaveAt = nowMs;
+      persistVerdictStates(this.verdictLongStates, this.verdictShortStates, this.btcRegime);
+    }
 
     // Per-pair updates for subscribed coin sheets.
     for (const pair of this.extraPairs) {

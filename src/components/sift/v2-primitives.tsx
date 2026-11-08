@@ -6,12 +6,12 @@
 // chips, final-score pills, the filter checklist, ATR-sized trade plans with
 // dollar risk framing, the scenario map, and wall/warning readouts.
 
-import { AlertTriangle, ArrowDownRight, ArrowUpRight, Ban, Crosshair, Eye, Landmark, ShieldAlert, TrendingDown, TrendingUp } from "lucide-react";
+import { AlertTriangle, ArrowDownRight, ArrowUpRight, Ban, Crosshair, Eye, Hourglass, Landmark, ShieldAlert, TrendingDown, TrendingUp } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { formatPrice } from "@/lib/market/format";
 import { BTC_MODE_COPY, V2, suggestedPositionUsd } from "@/lib/market/v2-engine";
-import type { BtcContext, RowVerdict, RadarRowV2, Scenario, TradePlan, V2Check } from "@/lib/market/types";
+import type { BtcContext, RowVerdict, RadarRowV2, RadarVerdictState, Scenario, StabilityStats, TradePlan, V2Check } from "@/lib/market/types";
 
 // ── BTC market regime bar ────────────────────────────────────────────────────
 
@@ -80,19 +80,103 @@ const VERDICT_STYLE: Record<RowVerdict, { label: string; className: string; icon
   stable: { label: "Stablecoin — ignore", className: "text-muted-foreground border-border bg-muted/40 line-through", icon: Ban },
 };
 
-export function VerdictChip({ verdict, size = "md" }: { verdict: RowVerdict; size?: "sm" | "md" }) {
+/** Compact relative time — the "since" stamp that makes stability visible. */
+export function relSince(ms: number, nowMs: number): string {
+  const s = Math.max(0, Math.round((nowMs - ms) / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+export function VerdictChip({
+  verdict,
+  size = "md",
+  state,
+  nowMs,
+}: {
+  verdict: RowVerdict;
+  size?: "sm" | "md";
+  /** V2.2 — the verdict STATE behind this verdict: renders the "since" stamp,
+   *  the confirming marker, the exit-pending marker and the reason tooltip. */
+  state?: RadarVerdictState | null;
+  nowMs?: number;
+}) {
   const meta = VERDICT_STYLE[verdict];
   const Icon = meta.icon;
+  const isGo = verdict === "go_long" || verdict === "go_short";
+  const demoting = state?.name === "demoting";
+  const confirming = state?.name === "confirming";
+  const titleParts: string[] = [];
+  if (state) {
+    titleParts.push(`state: ${state.name}`);
+    if (nowMs !== undefined) titleParts.push(`since ${relSince(state.sinceMs, nowMs)} ago`);
+    if (state.lastChangeReason) titleParts.push(state.lastChangeReason);
+    if (state.scoreSmooth > 0) titleParts.push(`smoothed score ${state.scoreSmooth.toFixed(0)}`);
+  }
   return (
     <span
+      title={titleParts.length > 0 ? titleParts.join(" · ") : undefined}
       className={cn(
         "inline-flex items-center gap-1 whitespace-nowrap rounded-md border px-1.5 leading-none",
         size === "md" ? "py-1 text-[11px]" : "py-0.5 text-[10px]",
         meta.className,
+        demoting && "opacity-90",
       )}
     >
       {Icon && <Icon className={size === "md" ? "size-3" : "size-2.5"} aria-hidden="true" />}
-      {meta.label}
+      {confirming && verdict === "watch" ? "Confirming…" : meta.label}
+      {demoting && (
+        <span className="inline-flex items-center gap-0.5 rounded bg-warn/15 px-1 font-normal text-warn" title="exit not yet confirmed — the deadband holds this GO">
+          <Hourglass className="size-2.5" aria-hidden="true" />
+          exit?
+        </span>
+      )}
+      {state && nowMs !== undefined && isGo && !demoting && (
+        <span className="num font-mono font-normal opacity-80" title={`state entered ${relSince(state.sinceMs, nowMs)} ago`}>
+          {relSince(state.sinceMs, nowMs)}
+        </span>
+      )}
+    </span>
+  );
+}
+
+/** V2.2 — shadow mode: the state machine confirmed a GO but the expectancy
+ *  gate refuses to fire it at the calibrated odds. Show it, don't hide it. */
+export function WouldBeGoChip({ note, size = "sm" }: { note: string | null; size?: "sm" | "md" }) {
+  return (
+    <span
+      title={note ?? "expectancy gate — calibrated hit rate below the GO floor; a kinder backtest re-opens this"}
+      className={cn(
+        "inline-flex items-center gap-1 whitespace-nowrap rounded-md border border-dashed border-warn/60 bg-transparent px-1.5 font-semibold leading-none text-warn",
+        size === "md" ? "py-1 text-[11px]" : "py-0.5 text-[10px]",
+      )}
+    >
+      <Eye className={size === "md" ? "size-3" : "size-2.5"} aria-hidden="true" />
+      would-be GO
+    </span>
+  );
+}
+
+/** V2.2 — the stability chip: churn / flip ratio / stale-flip ratio from the
+ *  verdict-change log. Visible proof the decision layer is deliberately
+ *  stable, not slow. */
+export function StabilityChip({ stability }: { stability: StabilityStats }) {
+  const churnOk = stability.changesPerPairMin < 2;
+  const flipOk = stability.flipRatio < 0.1;
+  const ok = churnOk && flipOk;
+  const gateList = stability.topGates.map((g) => `${g.gate}: ${g.changes}`).join(" · ");
+  return (
+    <span
+      title={`verdict-layer churn over the last 10 min — ${stability.windowChanges} state changes · ${ok ? "healthy" : "noisy"}${gateList ? ` · top flicker sources: ${gateList}` : ""}`}
+      className={cn(
+        "num inline-flex items-center gap-1.5 rounded-md border px-1.5 py-0.5 font-mono text-[10px] font-medium leading-none",
+        ok ? "border-up/40 text-up" : "border-warn/40 text-warn",
+      )}
+    >
+      <ShieldAlert className="size-2.5" aria-hidden="true" />
+      {stability.changesPerPairMin.toFixed(1)} chg/pair·min · flips {(stability.flipRatio * 100).toFixed(0)}%
+      {stability.staleFlipRatio > 0.05 && <span className="text-warn">· stale {(stability.staleFlipRatio * 100).toFixed(0)}%</span>}
     </span>
   );
 }
@@ -376,12 +460,13 @@ export function V2Panel({
 }) {
   const plan = v2.trade;
   const shortPlan = v2.shortTrade;
+  const state = v2.state ?? null;
   return (
     <div className="space-y-3 rounded-xl border border-border bg-card p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <h3 className="text-sm font-semibold">V2 verdict</h3>
-          <VerdictChip verdict={v2.verdict} />
+          <VerdictChip verdict={v2.verdict} state={state} nowMs={Date.now()} />
         </div>
         <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
           <span className="num font-mono">
@@ -393,6 +478,19 @@ export function V2Panel({
         </div>
       </div>
 
+      {/* V2.2 — the state line: what the decision layer is doing and why. */}
+      {state && (
+        <p className="num rounded-md border border-border bg-muted/30 px-2 py-1 font-mono text-[10px] leading-relaxed text-muted-foreground" title={state.lastChangeReason ?? undefined}>
+          verdict state: <span className="font-semibold text-foreground">{state.name}</span> · smoothed score {state.scoreSmooth.toFixed(0)}
+          {state.confirmCount > 0 ? ` · confirming ${state.confirmCount}` : ""}
+          {state.lastChangeReason ? ` · ${state.lastChangeReason}` : ""}
+        </p>
+      )}
+      {v2.wouldBeGo === true && (
+        <p className="rounded-md border border-dashed border-warn/50 px-2 py-1 text-[11px] leading-relaxed text-warn" title={v2.expectancyNote ?? undefined}>
+          The verdict layer confirmed this setup — but the expectancy gate holds the fire: {v2.expectancyNote ?? "calibrated hit rate below the GO floor"}. A backtest on a kinder window re-opens it automatically.
+        </p>
+      )}
       {v2.axes && (
         <div
           role="img"

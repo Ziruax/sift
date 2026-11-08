@@ -1,13 +1,33 @@
-# Sift — Complete Algorithm Reference (V2.1, post-audit)
+# Sift — Complete Algorithm Reference (V2.2, post-stability-audit)
 
 > **What this document is.** A full, honest description of every algorithm
-> inside Sift V2.1: how the universe is selected, how each metric is derived,
-> how the three-axis score is built, how the hard gates veto, how trade plans
-> (entry / stop / TP1 / TP2) are constructed for both longs and shorts, how
-> scenarios are generated *before* the decision, how signals are cooled down,
-> how every signal is graded after the fact, and how the backtest measures (or
-> fails to measure) all of it. Written so you can audit each threshold and
-> judge the logic yourself.
+> inside Sift V2.2: how the universe is selected, how each metric is derived,
+> how the three-axis score is built, how the hard gates veto, how the
+> **stateful verdict layer** turns a per-snapshot score into a stable,
+> explained verdict (V2.2's addition), how trade plans (entry / stop / TP1 /
+> TP2) are constructed for both longs and shorts, how scenarios are generated
+> *before* the decision, how signals are cooled down, how every signal is
+> graded after the fact, and how the backtest measures (or fails to measure)
+> all of it. Written so you can audit each threshold and judge the logic
+> yourself.
+>
+> **What changed in V2.2 (the stateless-verdict fix).** A second external
+> audit — an end-to-end read of this repository — found the V2.1 measurement
+> layer sound but the DECISION layer missing: the verdict was a pure function
+> of one row snapshot, every threshold was a hard step, the BTC regime was a
+> tick-flippable step function, the wall score cliffed at 75 s, the
+> calibration was banded (a 0.12 jump in p at the band edge), and the UI
+> re-sorted by score so a stable coin could vanish because a *different* coin
+> scored higher. Symptom: verdicts flickering go ↔ watch ↔ skip every scan.
+> V2.2 adds the decision layer (`verdict-state.ts`): EWM-smoothed scores,
+> enter/exit hysteresis pairs on every gate, confirmation counts, dwell
+> times, exit confirmation, a stale-input freeze, a dwelled BTC regime with
+> an ATR deadband, wall-score interpolation + absence confirmation, a
+> continuous (isotonic-interpolated) calibration, pinned display ordering,
+> and instrumentation (the stability chip) that measures whether it worked.
+> The honesty contract is unchanged — in particular the expectancy gate still
+> refuses to fire GOs the calibration can't pay for; V2.2 just makes the
+> refusal **stable and explained** instead of twitchy.
 >
 > **What changed in V2.1.** An external algorithm audit found three outright
 > bugs (a blacklist that silently killed JUP/BNB/SHIB/ARB; a volume baseline
@@ -49,13 +69,14 @@
 10. [New signals — OI, funding, L/S ratio, CVD, trade-size skew, wall age](#10-new-signals--oi-funding-ls-ratio-cvd-trade-size-skew-wall-age)
 11. [Scenario analysis & backtest calibration](#11-scenario-analysis--backtest-calibration)
 12. [Signal system, anti-flip-flop cooldowns & the portfolio layer](#12-signal-system-anti-flip-flop-cooldowns--the-portfolio-layer)
-13. [Outcome grading — accountability loop](#13-outcome-grading--accountability-loop)
-14. [Backtest — the honest edition](#14-backtest--the-honest-edition)
-15. [Bots & FreeCryptoAPI integration](#15-bots--freecryptoapi-integration)
-16. [Reliability engineering](#16-reliability-engineering)
-17. [Complete tunables table (tuned vs assumed)]#17-complete-tunables-table-tuned-vs-assumed)
-18. [Worked examples](#18-worked-examples)
-19. [Known limitations (honest list)](#19-known-limitations-honest-list)
+13. [The stateful verdict layer — dwell, hysteresis, confirmation (V2.2)](#13-the-stateful-verdict-layer--dwell-hysteresis-confirmation-v22)
+14. [Outcome grading — accountability loop](#14-outcome-grading--accountability-loop)
+15. [Backtest — the honest edition](#15-backtest--the-honest-edition)
+16. [Bots & FreeCryptoAPI integration](#16-bots--freecryptoapi-integration)
+17. [Reliability engineering](#17-reliability-engineering)
+18. [Complete tunables table (tuned vs assumed)](#18-complete-tunables-table-tuned-vs-assumed)
+19. [Worked examples](#19-worked-examples)
+20. [Known limitations (honest list)](#20-known-limitations-honest-list)
 
 ---
 
@@ -69,9 +90,12 @@ One shared brain, three data consumers:
 | **In-browser engine** | `src/lib/market/local-radar.ts` | Binance **public websockets** (`!miniTicker@arr` + per-pair `aggTrade`) — no key, no server. This is what runs on static hosting (Netlify). |
 | **Backtest simulator** | `src/components/sift/backtest-view.tsx` + `scripts/tune-v2.ts` | Replays history through the *exact same* filter functions. |
 
-Shared pure logic lives in two modules so all three tiers compute identical
-numbers: `src/lib/market/v2-engine.ts` (scoring, gates, plans, backtest) and
-`src/lib/market/baseline.ts` (blacklist, baselines, book analysis, beta, CVD).
+Shared pure logic lives in three modules so all three tiers compute identical
+numbers: `src/lib/market/v2-engine.ts` (scoring, gates, plans, backtest),
+`src/lib/market/baseline.ts` (blacklist, baselines, book analysis, beta, CVD),
+and — V2.2 — `src/lib/market/verdict-state.ts` (the stateful verdict layer,
+§13: the state machine, the dwelled BTC regime, the verdict overlay, and the
+change log / stability metrics).
 
 The browser picks its tier automatically (upgrade path, best wins):
 `live` (socket.io) → `fallback` (REST poll) → `local` (in-browser engine).
@@ -107,7 +131,10 @@ gate reads `(lastClose − klines[0].open)/klines[0].open` from the 288-candle
 window — never the up-to-60s-stale ticker field.
 
 The **scan itself is pure computation over the in-memory stores — zero
-network.** It runs every 5 s (server) / 1 s (browser engine).
+network.** It runs every 3 s on the server (V2.2: the scan IS the verdict
+tick) and every 1 s in the browser engine — with the browser's VERDICT
+advancing every 3rd tick (§13). Prices stay tick-fresh; verdicts are
+decision-fresh.
 
 ### 2.2 Adaptive rate limiting (shared-IP survival)
 
@@ -377,7 +404,7 @@ they persist a minute. The old engine treated a 5-second spoof and an
 | L/S account ratio extreme for the side | −5 (retail crowding) |
 | OI ≥ +0.3% and price up (long) | **+5** (new money, real move) |
 
-The OI/funding/L-S weights are **provisional (ASSUMED)** — see §17's
+The OI/funding/L-S weights are **provisional (ASSUMED)** — see §18's
 tuned/untuned split; they are displayed and logged so their contribution
 distributions can be measured before they're trusted.
 
@@ -387,7 +414,7 @@ distributions can be measured before they're trusted.
 
 A GO is **not** just a number. After the composite clears the bar, every gate
 must pass or the verdict is demoted to `watch` with the vetoing gate recorded
-(`longDemoteGate` — which feeds the shadow log, §14.4):
+(`longDemoteGate` — which feeds the shadow log, §15.4):
 
 | Gate | Long requirement | Short requirement |
 |---|---|---|
@@ -477,7 +504,7 @@ Two honest readings:
 
 The original V2's 55–65% claims were artifacts: gross-of-fees grading,
 full-exit-at-TP1 grading, the broken 15m momentum measurement (a single
-stale bar — fixed in §14), 30-day windows, and survivorship-biased coin
+stale bar — fixed in §15), 30-day windows, and survivorship-biased coin
 selection. This table is the number the app now shows you.
 
 ### 8.3 The expectancy gate — a GO must pay for itself
@@ -578,7 +605,7 @@ to watch.
 
 **[AUDIT §4 — "signals you're not using that actually predict"]** All free,
 all from Binance public endpoints, all wired into the engine as score
-components, checklist notes, and warnings (weights provisional — §17):
+components, checklist notes, and warnings (weights provisional — §18):
 
 | Signal | Source | Interpretation wired in |
 |---|---|---|
@@ -660,7 +687,179 @@ measurable.
 
 ---
 
-## 13. Outcome grading — accountability loop (kept)
+## 13. The stateful verdict layer — dwell, hysteresis, confirmation (V2.2)
+
+**[STABILITY AUDIT Part A/B]** The V2.1 verdict was a pure function of one
+row snapshot: `assessRow(input) → verdict`, no memory. With hard-step
+thresholds everywhere and scans every 1–5 s over a rotating mix of fresh and
+stale inputs, the verdict label was free to flicker `go ↔ watch ↔ skip` on
+every scan — and the audit's read of the code found every amplifier: the
+score threshold (59.9/60.0/59.9), rvol (1.99/2.00/1.99), buy % (51.9/52.0),
+the BTC regime (one tick flips the whole market AND clears the cooldown
+ledger), the 75 s wall-staleness cliff (±23 points instantly), the banded
+calibration (p jumps 0.12 at the band edge, flipping the expectancy gate),
+and the UI's score-ranked emission (a stable coin vanishes because a
+*different* coin scored higher).
+
+V2.2 adds the missing decision layer: `src/lib/market/verdict-state.ts`, a
+small state machine between measurement and display. The raw assessment
+stays a pure per-snapshot function (the measurement layer was sound); the
+VERDICT the clients see is the state machine's output.
+
+### 13.1 The states
+
+| State | Meaning | Displayed as |
+|---|---|---|
+| `inactive` | never seen / hard-vetoed / kill switch | skip / blocked / stable |
+| `candidate` | smoothed score near the watch bar | watch |
+| `confirming` | smoothed score near the GO bar, awaiting confirmation | "Confirming…" |
+| `go` | confirmed (N scans), dwelled, visible | GO (with a "since Xm Ys" stamp) |
+| `watch` | confirmed watch — usually a demoted GO, dwelled | watch (stamped) |
+| `demoting` | was go, exit not yet confirmed | still GO + "exit?" marker |
+
+### 13.2 The reducer (per pair, per side, per verdict tick)
+
+Order of operations inside `nextVerdictState`:
+
+1. **Hard vetoes first** — stablecoin, BTC-regime block, kill switch. They
+   bypass the data-age freeze AND dwell: refusal must be immediate.
+2. **Data-age freeze** — if the stalest verdict input (klines, or the depth
+   snapshot when one exists) is older than 3 × the verdict tick (9 s), the
+   state holds unchanged. A cold pair's kline-pump rotation landing a block
+   can never move its verdict; only fresh data can.
+3. **Score smoothing** — `scoreSmooth = 0.25 × raw + 0.75 × prev` (EWM,
+   ~7 s half-life at the 3 s tick). The raw composite never drives a
+   transition directly.
+4. **Transitions with hysteresis + confirmation + dwell:**
+   - enter `confirming` at `scoreSmooth ≥ goBar − 3`;
+   - enter `go` after **3 consecutive qualifying scans** (5 in BTC flat mode
+     — chop needs more proof) with all classic gates green; a failing gate
+     RESETS the streak;
+   - a `go` cannot leave before **45 s of dwell** (a candidate holds 30 s, a
+     confirming 15 s — the lower states dwell too, a live flip-ratio fix);
+   - a `go` exits only when `scoreSmooth < 53` (enter bar 60) for **3
+     consecutive scans** — the exit is itself confirmed, and the interim
+     state is `demoting` (still displayed as GO with an "exit?" marker);
+   - a `watch` dwells 60 s and exits only under 42 (enter 47; a candidate
+     holds to the same 42 deadband before falling back to inactive).
+
+Every transition writes `lastChangedMs` and a human-readable
+`lastChangeReason` ("exit pending — smoothed 51 < 53 (2/3)", "confirmed — 3
+scans over the bar, gates green", "stale 41s — verdict frozen"), which the
+UI renders as the stamp and the tooltip.
+
+### 13.3 Gate hysteresis (deadbands on every hard gate)
+
+While a pair's state is `go`/`demoting`, the hard gates themselves run their
+EXIT thresholds — hysteresis lives in the gates too, not only above them:
+
+| Gate | Enter | Exit (hold) |
+|---|---|---|
+| Volume expansion (rvol) | ≥ 2.0× | ≥ 1.6× |
+| Crowd (buy %, long) | ≥ 52% | ≥ 49% |
+| Crowd (buy %, short) | ≤ 48% | ≤ 51% |
+| Momentum (residual vs ATR bar) | > 0.5 × bar | > 0.35 × bar |
+| Spread | ≤ 15 bps | ≤ 22 bps |
+| BTC 1h alignment (long) | > −0.1% | > −0.25% |
+
+The SCORE is never smoothed at the source — measurement stays raw; only
+pass/fail boundaries widen.
+
+### 13.4 The dwelled BTC regime
+
+`btcModeFor()` (the raw step function) is replaced in all tiers by
+`nextBtcRegime()` — a tracker with an **ATR deadband plus dwell**:
+
+- enter bull/dump at **0.5 × BTC's own 15m ATR**, leave only under
+  **0.3 × ATR** (a wide deadband — the regime can't oscillate on ticks);
+- a flip must persist **15 s** before it becomes effective;
+- on an effective flip, the cooldown ledger's directional blocks are
+  **SHORTENED to ≤ 10 minutes, not cleared** — blocked pairs re-enter the
+  candidate pool gradually instead of as one burst (V2.1 cleared them
+  outright: the flip itself was a burst amplifier, now dead twice over).
+
+### 13.5 Wall-score interpolation + absence confirmation
+
+Two flicker kills in the microstructure axis:
+
+- **Staleness interpolation:** the wall contribution ramps linearly from
+  full at 30 s to zero at the old 75 s cutoff — no cliff. A hard-gate wall
+  veto additionally needs `interp ≥ 0.5` (half-stale data doesn't demote).
+- **Absence confirmation:** "no wall in band" earns its +8 only after the
+  book has shown **30 s of continuous, fresh absence** — a wall being
+  pulled and republished can no longer oscillate the score by ±23 points.
+
+### 13.6 Continuous calibration
+
+`lookupHitRate` now interpolates p **linearly between band midpoints** over
+a monotone (pool-adjacent-violators, decided-weighted) fit of the binned
+rates. A pair at 79.9 and one at 80.1 can no longer straddle a 0.12 jump in
+p — the score is continuous and the expectancy gate's input now is too.
+
+### 13.7 The overlay — and where the expectancy gate still sits
+
+After the state machines advance, `overlayVerdictState` rewrites the row's
+verdict fields from the states; the stateless assessment's verdict survives
+as `rawVerdict` (diagnostics). The **expectancy meta-gate stays downstream**
+of the state machine exactly as before:
+
+- state `go` + raw verdict `go` → **GO LONG / GO SHORT** (fires);
+- state `go` + expectancy veto → **"would-be GO"** — displayed honestly
+  (shadow mode, §13.9) with the numbers, never fired;
+- state `go` + a classic gate failing *through the deadband* → watch with
+  the exit confirmation already running.
+
+A GO signal fires on the state machine's **transition into `go`** —
+confirmed, dwelled, hysteresis-held — in live and replay alike.
+
+### 13.8 Pinned emission order + persistence
+
+Rows are emitted **GO states first, rows pinned after leaving GO/watch
+second (2-minute pin), then everything else by smoothed score** — a visible
+coin can no longer be bumped out of sight by a new candidate. The browser
+engine persists the state maps to localStorage every 30 s, so a page reload
+does not reset every dwell timer.
+
+### 13.9 The UI contract
+
+- **Verdict badge reads the state** — `GO LONG · 2m 14s` (the stamp is
+  visible proof of stability), `Confirming…`, `GO · exit?` for demoting.
+- **Hover tooltip = lastChangeReason** — "why is this about to change", not
+  a silent vanish.
+- **Shadow mode (default on)** — shows the would-be GOs the expectancy gate
+  is honestly refusing, with their note ("Calibrated hit rate 26% (n=480) →
+  est. −0.47R — below the +0.10R floor"). The refusal is the interesting
+  state; hiding it was the "always watch" perception problem.
+- **Stability chip** — churn / flip ratio / stale-flip ratio from the
+  verdict-change log (§13.10), always visible in the radar header.
+
+### 13.10 Instrumentation — measuring the fix
+
+Every state-name change is logged with `{pair, side, at, from, to,
+scoreSmooth, rawScore, dataAgeMs, firstFailingGate, reason}` (bounded at
+300 entries; the browser persists it with the states). The header's
+stability chip computes over the last 10 minutes:
+
+| Metric | Healthy target |
+|---|---|
+| verdict changes / pair / min | < 2 |
+| flip ratio (change reversed within 30 s) | < 10% |
+| stale-flip ratio (change while data age > 2 × cadence) | < 5% |
+| per-gate change attribution | names the largest remaining flicker source |
+
+### 13.11 The backtest drives the same machine
+
+`backtestSymbol` advances the state machines at every CLOSED 5m bar with
+`replayVerdictConfig()`: confirmation 3 scans → 2 bars, dwell 45 s → 1 bar,
+exit confirm 1 bar, freeze disabled (a closed bar is fresh at its own
+close). Trades fire on the transition into `go` and are scored by
+`scoreSmooth` — the calibration bins map what the live system ranks by. If
+the live verdict and the replay verdict came from different code, that
+would re-create the audit's central complaint; they don't.
+
+---
+
+## 14. Outcome grading — accountability loop (kept)
 
 Every fired signal is tracked to maturity: price/change at 5/15/60 min,
 running direction-adjusted MFE/MAE, persisted (SQLite via ingest webhook
@@ -672,7 +871,7 @@ not fill-price, and do not subtract fees.
 
 ---
 
-## 14. Backtest — the honest edition
+## 15. Backtest — the honest edition
 
 **[AUDIT §6 — "the weakest link"]** The V2 backtest was honest about order
 books but dishonest by omission about nearly everything else. V2.1:
@@ -742,7 +941,7 @@ stricter, and the wall block remains flagged UNTUNED), historical OI/funding
 
 ---
 
-## 15. Bots & FreeCryptoAPI integration (unchanged)
+## 16. Bots & FreeCryptoAPI integration (unchanged)
 
 A **bot** = investment amount + entry + direction + **target range** [low,
 high] + optional **stop range** + expiry, in browser localStorage. While any
@@ -755,7 +954,7 @@ native notification. FreeCryptoAPI outage → Binance public ticker failover.
 
 ---
 
-## 16. Reliability engineering (kept, plus the restart-proof fixes)
+## 17. Reliability engineering (kept, plus the restart-proof fixes)
 
 | Problem | Solution |
 |---|---|
@@ -774,14 +973,14 @@ endpoints — all behind TTL-cache + inflight-dedup + stale-serve.
 
 ---
 
-## 17. Complete tunables table (tuned vs assumed)
+## 18. Complete tunables table (tuned vs assumed)
 
 **[AUDIT §15 — "half the tunables had no derivation"]** Every constant in
 `V2` (v2-engine.ts), sorted by evidence. **TUNED** = derived from replaying
 real history (`scripts/tune-v2.ts`, 14d × 16 coins, ranked by net
 expectancy-R × trades with Wilson-CI finalists). **ASSUMED** = documented
 rationale, no validated derivation — these are the high-risk knobs; the
-shadow log (§14.4) is the instrument that will retire them.
+shadow log (§15.4) is the instrument that will retire them.
 
 | Constant | Value | Class | Derivation |
 |---|---|---|---|
@@ -823,7 +1022,35 @@ shadow log (§14.4) is the instrument that will retire them.
 | `correlationMax` | 0.7 | ASSUMED | ρ-gate |
 | `killSwitchLossStreak` / `killSwitchDayLossR` | 5 / −6R | ASSUMED | kill switch |
 | universe | top 60 by 7-day volume anomaly | TUNED structure | floors $2M vol / 5k trades |
-| scan cadence | 5 s server / 1 s browser | — | compute-only |
+| scan cadence | 3 s server (verdict tick) / 1 s browser prices, 3 s verdict | — | compute-only |
+
+### 18b. Verdict-layer constants (V2.2 — the stability knobs)
+
+**[STABILITY AUDIT Part B.9]** All ASSUMED — deliberately. These are
+*stability* knobs, not *edge* knobs: they do not change WHICH setups fire,
+only how steadily the verdict is expressed. Raising `goScore` to fix
+flicker would trade fewer signals for still-flickering ones — the
+deadbands and dwell are the fix, and the stability chip (§13.10) measures
+them so they can be retired with evidence, not faith.
+
+| Constant | Value | Why |
+|---|---|---|
+| `verdictScanCadenceMs` | 3 000 | 10× fewer recomputations than the 1 s price tick; decisions don't need tick speed |
+| `scoreAlpha` | 0.25 | EWM half-life ≈ 7 s at the 3 s tick — one noise spike can't cross a bar |
+| `goExit` / `watchExit` | 53 / 42 | 30–40 % deadband below the enter bars (60 / 47) |
+| `goConfirmScans` / `goConfirmScansChop` | 3 / 5 | ~10 s / ~15 s of consecutive proof; flat BTC mode needs more |
+| `goExitConfirmScans` | 3 | the EXIT is confirmed too — no one-tick demotions |
+| `goDwellMinMs` / `watchDwellMinMs` | 45 s / 60 s | the core flicker killer — a confirmed verdict can't leave instantly |
+| `candidateDwellMs` / `confirmingDwellMs` | 30 s / 15 s | the LOWER states dwell too — live flip-ratio fix (41% → target < 10%) |
+| `displayPinAfterLeaveMs` | 120 s | a row leaving GO stays pinned — no vanish-after-exit |
+| `dataAgeFreezeMultiplier` | 3 × cadence | stale inputs hold the state; only fresh data moves a verdict |
+| `btcRegimeDwellMs` | 15 s | the biggest burst amplifier, dead |
+| `btcRegimeAtrEnter` / `btcRegimeAtrExit` | 0.5 / 0.3 | ATR deadband on the regime flip itself |
+| `wallAbsentConfirmMs` | 30 s | kills the pull-and-republish wall oscillation |
+| `wallStaleInterpolateMs` | 30 s | wall score ramps to zero by 75 s — no cliff |
+| `rvolExit` / `buyPctLongExit` / `buyPctShortExit` | 1.6 / 49 / 51 | gate deadbands while a GO holds |
+| `spreadExitBps` / `residExitMult` / `btc1hLongExit` | 22 / 0.35 / −0.25 | same — enter strict, exit loose |
+| replay: `goConfirmBars` / `goDwellBars` / `goExitConfirmBars` | 2 / 1 / 1 | the state machine at bar close (§13.11) — what you backtest is what you trade |
 
 To re-tune: `bun scripts/tune-v2.ts [days] [coins]` — prints long/short/
 combined rankings by net expectancy-R × trades with CIs. Pick the config
@@ -831,7 +1058,7 @@ whose CI excludes zero.
 
 ---
 
-## 18. Worked examples
+## 19. Worked examples
 
 **1. The old blacklist killing real tokens [AUDIT §2.1].** JUP (Jupiter,
 top-40 volume) ends in "UP" → V2 excluded it from the universe. BNB — the
@@ -875,7 +1102,7 @@ outcomes are graded — the cost of the guard is visible, not assumed.
 
 ---
 
-## 19. Known limitations (honest list)
+## 20. Known limitations (honest list)
 
 1. **No filter set predicts the market — and the app now says so.** The
    measured 90-day calibration (§8.2) ships INSIDE the engine: hit rates of
@@ -891,7 +1118,7 @@ outcomes are graded — the cost of the guard is visible, not assumed.
    replay cannot validate `wallVsTaker`, `wallFreshSec`, or the wall weights.
    Live is strictly stricter than backtest; the live shadow log is the only
    instrument that can retire this.
-4. **OI/funding/L-S weights are provisional** (ASSUMED in §17) — displayed
+4. **OI/funding/L-S weights are provisional** (ASSUMED in §18) — displayed
    and logged, not validated.
 5. **Point-in-time universe is a compromise**: selection within the pool is
    historical; the pool itself is today's top-120 (stated in the UI).
@@ -907,3 +1134,10 @@ outcomes are graded — the cost of the guard is visible, not assumed.
    cheap add.)
 10. **FreeCryptoAPI credits** are spent only while bots are armed; poll
     cadence is the cost control.
+11. **The verdict-layer constants are ASSUMED (§18b)** — stability knobs,
+    measured live by the stability chip (churn / flip / stale-flip ratios and
+    per-gate attribution) rather than validated by replay. The state machine
+    also adds deliberate latency: a GO needs ~10 s of confirmation + dwell
+    before it can fire, and its exit needs ~9 s more. That is the point —
+    patience, not twitchiness — but a 10-second-faster market is a real
+    trade-off the UI states on every stamped verdict.

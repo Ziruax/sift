@@ -1,19 +1,22 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, ChevronDown, Filter, Radio, Zap } from "lucide-react";
+import { AlertTriangle, ChevronDown, Eye, Filter, Radio, Zap } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { formatCompact } from "@/lib/market/format";
 import type { RadarSnapshot, RadarRow, TradePlan } from "@/lib/market/types";
 import { EmptyState, LivePrice, Pct, RadarBadgeChip, RowSkeleton, Sparkline, SpikeMeter, BuyBar } from "./primitives";
-import { FinalScorePill, VerdictChip, WarningsRow, FilterCheckList, ScenarioList, TradePlanCard, WallLine } from "./v2-primitives";
+import { FinalScorePill, VerdictChip, WarningsRow, FilterCheckList, ScenarioList, TradePlanCard, WallLine, WouldBeGoChip, StabilityChip } from "./v2-primitives";
 
-type Group = "all" | "go_long" | "go_short" | "watch" | "pumping" | "lead" | "dumping" | "avoid";
+type Group = "all" | "go_long" | "go_short" | "wouldbe" | "watch" | "pumping" | "lead" | "dumping" | "avoid";
 
 const GROUPS: { id: Group; label: string; test: (r: RadarRow) => boolean }[] = [
   { id: "all", label: "All", test: () => true },
   { id: "go_long", label: "GO LONG — V2", test: (r) => r.v2?.verdict === "go_long" },
   { id: "go_short", label: "GO SHORT — V2", test: (r) => r.v2?.verdict === "go_short" },
+  // V2.2 — shadow mode's discovery surface: setups the state machine confirmed
+  // but the expectancy gate refuses to fire at the calibrated odds.
+  { id: "wouldbe", label: "Would-be GO", test: (r) => r.v2?.wouldBeGo === true },
   { id: "watch", label: "Watch only", test: (r) => r.v2?.verdict === "watch" },
   { id: "pumping", label: "Pumping now", test: (r) => r.signal === "pumping" },
   { id: "lead", label: "Volume leading", test: (r) => r.volumeLead },
@@ -35,10 +38,18 @@ export function RadarView({
   const [hideStable, setHideStable] = useState(true);
   const [secondsAgo, setSecondsAgo] = useState(0);
   const [expanded, setExpanded] = useState<string | null>(null);
+  // V2.2 — shadow mode (default ON): show the state machine's confirmed setups
+  // even while the expectancy gate honestly refuses to fire them — the raw
+  // refusal is the interesting state, not a reason to show an empty screen.
+  const [shadowMode, setShadowMode] = useState(true);
+  const [nowMs, setNowMs] = useState(() => Date.now());
 
   useEffect(() => {
     if (!snapshot) return;
-    const tick = () => setSecondsAgo(Math.max(0, Math.round((Date.now() - new Date(snapshot.updatedAt).getTime()) / 1000)));
+    const tick = () => {
+      setSecondsAgo(Math.max(0, Math.round((Date.now() - new Date(snapshot.updatedAt).getTime()) / 1000)));
+      setNowMs(Date.now()); // drives the "GO since 2m 14s" stamps
+    };
     tick();
     const id = setInterval(tick, 1000);
     return () => clearInterval(id);
@@ -50,7 +61,7 @@ export function RadarView({
     if (hidePumped) list = list.filter((r) => r.badge !== "pumped");
     if (hideStable) list = list.filter((r) => r.v2?.verdict !== "stable");
     const g = GROUPS.find((x) => x.id === group);
-    return g ? list.filter(g.test) : list;
+    return (g ? list.filter(g.test) : list).slice(0, 120);
   }, [snapshot, group, hidePumped, hideStable]);
 
   const banner = useMemo(() => {
@@ -99,6 +110,17 @@ export function RadarView({
           </span>
         </p>
         <div className="flex flex-wrap gap-3">
+          {snapshot.stability && <StabilityChip stability={snapshot.stability} />}
+          <label className="flex min-h-9 cursor-pointer select-none items-center gap-2 text-xs text-muted-foreground" title="Show setups the verdict layer confirmed but the expectancy gate refuses to fire at the calibrated odds">
+            <Eye className="size-3.5" aria-hidden="true" />
+            <span className={cn(shadowMode && "text-foreground")}>Shadow mode</span>
+            <input
+              type="checkbox"
+              checked={shadowMode}
+              onChange={(e) => setShadowMode(e.target.checked)}
+              className="size-4 accent-(--warn)"
+            />
+          </label>
           <label className="flex min-h-9 cursor-pointer select-none items-center gap-2 text-xs text-muted-foreground">
             <Filter className="size-3.5" aria-hidden="true" />
             <span className={cn(hideStable && "text-foreground")}>Hide stablecoins</span>
@@ -197,7 +219,7 @@ export function RadarView({
           </thead>
           <tbody className="max-h-[70vh] overflow-y-auto">
             {rows.map((r) => (
-              <RadarRowLine key={r.pair} row={r} expanded={expanded === r.pair} onExpand={expand} onOpenPair={onOpenPair} onLaunchBot={onLaunchBot} />
+              <RadarRowLine key={r.pair} row={r} expanded={expanded === r.pair} onExpand={expand} onOpenPair={onOpenPair} onLaunchBot={onLaunchBot} shadowMode={shadowMode} nowMs={nowMs} />
             ))}
           </tbody>
         </table>
@@ -241,7 +263,7 @@ export function RadarView({
                 </div>
               </div>
               <div className="flex shrink-0 flex-col items-end gap-1.5">
-                {r.v2 ? <FinalScorePill score={r.v2.longScore} verdict={r.v2.verdict} size="sm" /> : <ScorePlaceholder />}
+                {r.v2 ? <FinalScorePill score={r.v2.state?.scoreSmooth ?? r.v2.longScore} verdict={r.v2.verdict} size="sm" /> : <ScorePlaceholder />}
                 <Sparkline points={r.spark} />
               </div>
             </button>
@@ -253,7 +275,8 @@ export function RadarView({
                 aria-expanded={expanded === r.pair}
               >
                 <span className="flex items-center gap-1.5">
-                  <VerdictChip verdict={r.v2.verdict} size="sm" />
+                  <VerdictChip verdict={r.v2.verdict} size="sm" state={r.v2.state} nowMs={nowMs} />
+                  {shadowMode && r.v2.wouldBeGo === true && <WouldBeGoChip note={r.v2.expectancyNote ?? null} />}
                   {r.v2.hitRate != null && r.v2.hitRate.n > 0 && <CalChip p={r.v2.hitRate.p} n={r.v2.hitRate.n} />}
                 </span>
                 <span className="flex items-center gap-1 text-[11px] text-muted-foreground">
@@ -305,12 +328,16 @@ function RadarRowLine({
   onExpand,
   onOpenPair,
   onLaunchBot,
+  shadowMode,
+  nowMs,
 }: {
   row: RadarRow;
   expanded: boolean;
   onExpand: (pair: string) => void;
   onOpenPair: (pair: string) => void;
   onLaunchBot?: (pair: string, plan: TradePlan) => void;
+  shadowMode: boolean;
+  nowMs: number;
 }) {
   return (
     <>
@@ -370,11 +397,12 @@ function RadarRowLine({
           </span>
         </td>
         <td className="px-3 py-2.5 text-center">
-          {row.v2 ? <FinalScorePill score={row.v2.longScore} verdict={row.v2.verdict} /> : <ScorePlaceholder />}
+          {row.v2 ? <FinalScorePill score={row.v2.state?.scoreSmooth ?? row.v2.longScore} verdict={row.v2.verdict} /> : <ScorePlaceholder />}
         </td>
         <td className="px-3 py-2.5">
           <span className="inline-flex items-center gap-1.5">
-            {row.v2 ? <VerdictChip verdict={row.v2.verdict} /> : <RadarBadgeChip badge={row.badge} />}
+            {row.v2 ? <VerdictChip verdict={row.v2.verdict} state={row.v2.state} nowMs={nowMs} /> : <RadarBadgeChip badge={row.badge} />}
+            {shadowMode && row.v2?.wouldBeGo === true && <WouldBeGoChip note={row.v2.expectancyNote ?? null} />}
             {row.v2 && row.v2.hitRate != null && row.v2.hitRate.n > 0 && <CalChip p={row.v2.hitRate.p} n={row.v2.hitRate.n} />}
           </span>
         </td>

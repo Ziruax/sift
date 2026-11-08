@@ -130,6 +130,29 @@ export type Scenario = { tone: "bull" | "base" | "bear"; title: string; body: st
 export type RowVerdict = "go_long" | "go_short" | "watch" | "skip" | "blocked_btc" | "stable";
 export type SideVerdict = "go" | "watch" | "skip" | "blocked_btc";
 
+// ── V2.2 — the stateful verdict layer (verdict-state.ts) ────────────────────
+// The serialized shape of a VerdictState as it travels through snapshots.
+export type VerdictStateName = "inactive" | "candidate" | "confirming" | "go" | "watch" | "demoting";
+
+export type RadarVerdictState = {
+  name: VerdictStateName;
+  scoreSmooth: number; // EWM of the composite — what the state machine acts on
+  sinceMs: number; // when entered (dwell anchor) — the "GO since Xm" stamp
+  confirmCount: number;
+  exitCount: number;
+  lastChangedMs: number;
+  lastChangeReason: string | null; // why the state changed / is about to
+  pinnedUntilMs: number; // display pin — cannot be bumped out of sight until
+};
+
+export type StabilityStats = {
+  changesPerPairMin: number; // verdict changes / pair / minute (10 min window)
+  flipRatio: number; // changes reversed within 30 s
+  staleFlipRatio: number; // changes while inputs were stale
+  windowChanges: number;
+  topGates: { gate: string; changes: number }[];
+};
+
 export type RadarRowV2 = {
   longScore: number; // UNCAPPED composite — UI displays min(score, 100) with a "+" marker
   shortScore: number;
@@ -155,6 +178,18 @@ export type RadarRowV2 = {
   futures?: { oiChange15m: number | null; fundingRatePct: number | null; lsRatio: number | null };
   longDemoteGate?: string | null; // first gate vetoing a would-be long GO (shadow logging)
   shortDemoteGate?: string | null;
+  // V2.2 — the stateful verdict layer (all optional; older snapshots load).
+  /** The LONG side's verdict state — drives the displayed verdict. */
+  state?: RadarVerdictState | null;
+  shortState?: RadarVerdictState | null;
+  /** The STATELESS assessment's verdict — diagnostics + shadow-mode display. */
+  rawVerdict?: RowVerdict;
+  /** State machine is GO but the expectancy gate holds the fire — the
+   *  honest "would-be GO" the shadow-mode toggle surfaces. */
+  wouldBeGo?: boolean;
+  expectancyNote?: string | null;
+  /** Age of the stalest verdict input (klines/depth) this scan. */
+  dataAgeMs?: number | null;
 };
 
 export type RadarRow = {
@@ -193,6 +228,7 @@ export type RadarSnapshot = {
   scans: number;
   stale: boolean; // true when the feed failed and this is the last good scan
   btc: BtcContext | null; // the market regime filter, live
+  stability?: StabilityStats | null; // V2.2 — verdict-layer churn metrics
 };
 
 // ── Signals (persisted opportunity log with graded outcomes) ────────────────

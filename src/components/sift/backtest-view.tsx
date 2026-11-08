@@ -378,7 +378,10 @@ export function BacktestView() {
         </h2>
         <p className="mt-1 max-w-3xl text-xs leading-relaxed text-muted-foreground">
           Replays the exact same V2 engine the live radar uses over days of real 5-minute Binance candles,
-          in your browser. Every <strong>go long</strong> / <strong>go short</strong> it would have fired is graded
+          in your browser — including the <strong>stateful verdict layer</strong> (V2.2): a GO fires only
+          when the smoothed score confirms over consecutive bars and dwells, and leaves only through the
+          hysteresis exit, exactly like the live scanner. Every <strong>go long</strong> / <strong>go short</strong> it
+          would have fired is graded
           against its own ATR-sized stop and take-profits: half the position comes off at TP1 (+2× risk), the stop
           moves to breakeven — the <strong>BE</strong> outcome is exactly that, TP1 then breakeven — and the runner
           targets TP2 (+3.5× risk). Same-bar collisions count as losses — conservative on purpose — and a 2-hour

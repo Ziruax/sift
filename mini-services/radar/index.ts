@@ -37,14 +37,26 @@ import {
   CooldownLedger,
   PortfolioGuard,
   V2,
-  assessRow,
+  assessRowWithSides,
   atrPctFromCandles,
   atrWindow,
-  btcModeFor,
   stablecoinLike,
   type BtcMode,
   type V2Wall,
 } from "../../src/lib/market/v2-engine";
+import {
+  liveVerdictConfig,
+  nextBtcRegime,
+  nextVerdictState,
+  overlayVerdictState,
+  stabilityStats,
+  verdictSortRank,
+  type BtcRegimeState,
+  type StabilityStats,
+  type VerdictChangeEntry,
+  type VerdictConfig,
+  type VerdictState,
+} from "../../src/lib/market/verdict-state";
 import {
   anomalyScore,
   analyzeDepth,
@@ -67,7 +79,7 @@ const PORT = 3003;
 // The vision mirror first; api.binance.com as failover for network errors.
 // 418/429 bans are per-IP and handled with hard, doubling backoff.
 const HOSTS = ["https://data-api.binance.vision", "https://api.binance.com", "https://api4.binance.com"];
-const SCAN_INTERVAL_MS = 5_000; // compute + emit cadence (no network)
+const SCAN_INTERVAL_MS = 3_000; // V2.2: the verdict tick (was 5s display-only cadence) — compute + emit, no network. Price snapshots still flow per-pair over socket rooms.
 const UNIVERSE_LIMIT = 60; // §2.2 — anomaly-ranked universe (was 40 by absolute volume)
 const UNIVERSE_REFRESH_MS = 5 * 60_000;
 const KLINE_LIMIT = 288; // §2.3 — 24h of 1m candles (kline weight class barely moves: 1→2)
@@ -145,6 +157,7 @@ type RadarSnapshot = {
   scans: number;
   stale: boolean;
   btc: BtcContext | null;
+  stability?: StabilityStats | null; // V2.2 — verdict-layer churn metrics
 };
 
 type SignalType =
@@ -289,6 +302,20 @@ let wallCandidates: string[] = [];
 const ledger = new CooldownLedger();
 // §10: a BTC regime flip voids directional blocks earned in the old regime.
 let lastBtcMode: BtcMode | null = null;
+// ── V2.2 — the stateful verdict layer (audit Part B) ────────────────────────
+// Per-pair, per-side verdict states + the dwelled BTC regime + the change log
+// that measures whether the stability layer is actually working.
+const verdictLongStates = new Map<string, VerdictState>();
+const verdictShortStates = new Map<string, VerdictState>();
+let btcRegime: BtcRegimeState | null = null;
+const verdictChangeLog: VerdictChangeEntry[] = []; // newest first, bounded
+const VERDICT_CHANGE_LOG_MAX = 300;
+const liveCfg: VerdictConfig = liveVerdictConfig();
+// Kline freshness per pair — the verdict's data-age freeze reads this.
+const candleAt = new Map<string, number>();
+// Wall-absence confirmation clocks (per side): "+8 no wall" only after 30 s.
+const askAbsentSince = new Map<string, number>();
+const bidAbsentSince = new Map<string, number>();
 // §4 futures positioning cache (funding / OI / L-S ratio), 60s TTL, paced fill.
 type FuturesData = { at: number; funding: number | null; oi: number | null; ls: number | null };
 const futuresCache = new Map<string, FuturesData>();
@@ -926,6 +953,7 @@ async function klinePumpLoop(): Promise<void> {
       );
       if (Array.isArray(payload) && (payload as Kline[]).length >= 16) {
         candles.set(pair, payload as Kline[]);
+        candleAt.set(pair, Date.now()); // V2.2 — verdict data-age clock
         failureStreaks.set(pair, 0);
         pairMissing.delete(pair);
       }
@@ -1038,6 +1066,23 @@ function knownWalls(pair: string): { ask: V2Wall; bid: V2Wall; known: boolean } 
   const cached = wallCache.get(pair);
   if (!cached || Date.now() - cached.at > WALL_KNOWN_MS) return { ask: null, bid: null, known: false };
   return { ask: cached.ask, bid: cached.bid, known: true };
+}
+
+/** V2.2 — wall-absence confirmation: how long has the book shown NO wall in
+ *  the scan band on this side? A pulled-and-republished wall can no longer
+ *  oscillate the score — the "+8 runway" accrues only after 30 s of
+ *  continuous, fresh absence. */
+function trackWallAbsence(map: Map<string, number>, pair: string, known: boolean, wall: V2Wall, nowMs: number): number | null {
+  if (known && wall === null) {
+    const since = map.get(pair);
+    if (since === undefined) {
+      map.set(pair, nowMs);
+      return 0;
+    }
+    return nowMs - since;
+  }
+  map.delete(pair); // wall reappeared, data went stale, or never known
+  return null;
 }
 
 // "Wall broken — confirmed": price must hold above the wall for 2 minutes.
@@ -1587,31 +1632,39 @@ async function scan(): Promise<void> {
       return;
     }
 
-    // ── BTC market regime — the filter every long/short answer runs through.
-    // §3.4: the regime bar is BTC's own 15m ATR, not a fixed ±0.3%.
+    // ── BTC market regime — V2.2: DWELLED with an ATR deadband (audit Part B
+    // step 3). One BTC tick can no longer flip the whole market's mode, which
+    // moved the GO threshold by 7 points and re-enabled blocked pairs in one
+    // shot — the old burst amplifier. Enter bull/dump at 0.5 × BTC's own 15m
+    // ATR, leave only under 0.3 × (deadband), and the flip must persist 15 s.
+    const nowMs = Date.now();
+    const prevRegimeMode = btcRegime?.mode ?? null;
+    btcRegime = nextBtcRegime(btcRegime, btcRow?.change15m ?? null, btcAtr15m, nowMs);
     if (btcRow) {
-      const mode = btcModeFor(btcRow.change15m, btcAtr15m) ?? "flat";
-      // §10: a regime flip voids directional blocks earned in the old regime —
-      // a dump block must not haunt the first hour of a bull flip.
-      if (lastBtcMode !== null && lastBtcMode !== mode) ledger.resetBlocks();
-      lastBtcMode = mode;
+      // V2.2: a regime flip now SHORTENS directional blocks to ≤10 min instead
+      // of clearing them (§10 kept the spirit; the burst is gone) — blocked
+      // pairs re-enter the candidate pool gradually, not all at once.
+      if (prevRegimeMode !== null && prevRegimeMode !== btcRegime.mode) {
+        ledger.shortenDirectional(10 * 60_000, nowMs);
+      }
+      lastBtcMode = btcRegime.mode;
       btcContext = {
         price: btcRow.price,
         change5m: btcRow.change5m,
         change15m: btcRow.change15m,
         change1h: btcRow.spark.length > 0 ? ((btcRow.price - (btcRow.spark[0] ?? btcRow.price)) / (btcRow.spark[0] ?? btcRow.price)) * 100 : 0,
         change24h: btcRow.change24h,
-        mode,
+        mode: btcRegime.mode,
       };
     }
 
-    // ── V2: the seven-filter assessment, attached to every row. Wall data is
-    // only fetched for the candidates below, so the rest honestly report
-    // "no wall data" in that filter.
-    rows.sort((a, b) => b.score - a.score || b.rvol - a.rvol);
+    // ── V2 assessment + the STATEFUL VERDICT LAYER (audit Part B step 2).
+    // The assessment stays a pure per-snapshot function; the VERDICT the
+    // clients see is the state machine's — EWM-smoothed score, confirmation
+    // counts, dwell, hysteresis exits, stale-input freeze. Wall data is only
+    // fetched for the candidates below, so the rest honestly report "no wall
+    // data" in that filter.
     const subscribed = new Set(pairRooms.keys());
-    const detailRank = new Map<string, number>();
-    rows.forEach((r, i) => detailRank.set(r.pair, i));
     for (const row of rows) {
       const known = knownWalls(row.pair);
       // §2.1: exact-match junk list + pegged-price behaviour.
@@ -1621,52 +1674,138 @@ async function scan(): Promise<void> {
       // it returns).
       const wallAgeSec = known.known ? trackWallAge(wallTracks, row.pair, known.ask) : null;
       const walls = known.known ? (wallCache.get(row.pair) ?? null) : null;
+      // V2.2 — depth-snapshot age (wall-score interpolation input) and the
+      // wall-absence confirmation clocks.
+      const wallDataAgeMs = walls !== null ? Math.max(0, nowMs - walls.at) : null;
+      const askAbsentMs = trackWallAbsence(askAbsentSince, row.pair, known.known, known.ask, nowMs);
+      const bidAbsentMs = trackWallAbsence(bidAbsentSince, row.pair, known.known, known.bid, nowMs);
       // §4 futures positioning — one missed refresh must not flicker the filter
       // to "no data", but 2×TTL-old data is honestly absent.
       const fut = futuresCache.get(row.pair);
       const futUsable = fut !== undefined && Date.now() - fut.at <= FUTURES_TTL_MS * 2 ? fut : null;
-      const v2 = assessRow({
-        base: row.base,
-        price: row.price,
-        change1m: row.change1m,
-        change5m: row.change5m,
-        change15m: row.change15m,
-        change24h: row.change24h,
-        vol5mUsd: row.vol5mUsd,
-        rvol: row.rvol,
-        trades5m: row.trades5m,
-        buyPct: row.buyPct,
-        baseScore: row.score,
-        atrPct: row.atrPct,
-        askWall: known.ask,
-        bidWall: known.bid,
-        askWallKnown: known.known,
-        wallBrokenConfirmed: wallBreakState(row.pair, row.price, known.ask),
-        btcChange15m: btcContext?.change15m ?? null,
-        btcChange1h: btcContext?.change1h ?? null,
-        isStablecoin: isStable,
-        // ── V2.1 feeds (§2.3/§3.4/§4/§2.5) ──
-        tradeSpike: row.tradeSpike,
-        closeStrength: row.closeStrength,
-        beta: row.beta ?? null,
-        residChange5m: row.residChange5m ?? null,
-        residChange15m: row.residChange15m ?? null,
-        btcChange5m: btcContext?.change5m ?? null,
-        btcAtr15m,
-        spreadBps: walls !== null ? walls.spreadBps : null,
-        wallAgeSec,
-        wallToDepthRatio: walls !== null ? walls.askWallToDepth : null,
-        askDepthToTp2Usd: walls !== null ? walls.askDepthUsd : null,
-        cvdSlope15m: row.cvdSlope15m ?? null,
-        avgTradeSizeSpike: row.avgTradeSizeSpike ?? null,
-        oiChange15m: futUsable !== null ? futUsable.oi : null,
-        fundingRatePct: futUsable !== null ? futUsable.funding : null,
-        lsRatio: futUsable !== null ? futUsable.ls : null,
-        listingAgeDays: listingAge.get(row.pair) ?? null,
-        historyBlocks: row.historyBlocks ?? null,
-      });
-      // Keep the payload sane: full checklists + scenarios for the top 20 and
-      // subscribed pairs; scores + verdict + warnings for the long tail.
+      // V2.2 — data age: the stalest verdict input (klines, and the depth
+      // snapshot when one exists). The state machine freezes transitions
+      // while this exceeds 3 × the verdict tick — a cold pair's kline
+      // rotation landing a block must never move its verdict.
+      const klineAgeMs = candleAt.has(row.pair) ? Math.max(0, nowMs - (candleAt.get(row.pair) ?? nowMs)) : 0;
+      const dataAgeMs = Math.max(klineAgeMs, wallDataAgeMs ?? 0);
+      const priorLong = verdictLongStates.get(row.pair) ?? null;
+      const priorShort = verdictShortStates.get(row.pair) ?? null;
+      const priorLongGo = priorLong?.name === "go" || priorLong?.name === "demoting";
+      const priorShortGo = priorShort?.name === "go" || priorShort?.name === "demoting";
+      const { row: v2, long: longAssess, short: shortAssess } = assessRowWithSides(
+        {
+          base: row.base,
+          price: row.price,
+          change1m: row.change1m,
+          change5m: row.change5m,
+          change15m: row.change15m,
+          change24h: row.change24h,
+          vol5mUsd: row.vol5mUsd,
+          rvol: row.rvol,
+          trades5m: row.trades5m,
+          buyPct: row.buyPct,
+          baseScore: row.score,
+          atrPct: row.atrPct,
+          askWall: known.ask,
+          bidWall: known.bid,
+          askWallKnown: known.known,
+          wallBrokenConfirmed: wallBreakState(row.pair, row.price, known.ask),
+          btcChange15m: btcContext?.change15m ?? null,
+          btcChange1h: btcContext?.change1h ?? null,
+          isStablecoin: isStable,
+          // ── V2.1 feeds (§2.3/§3.4/§4/§2.5) ──
+          tradeSpike: row.tradeSpike,
+          closeStrength: row.closeStrength,
+          beta: row.beta ?? null,
+          residChange5m: row.residChange5m ?? null,
+          residChange15m: row.residChange15m ?? null,
+          btcChange5m: btcContext?.change5m ?? null,
+          btcAtr15m,
+          spreadBps: walls !== null ? walls.spreadBps : null,
+          wallAgeSec,
+          wallToDepthRatio: walls !== null ? walls.askWallToDepth : null,
+          askDepthToTp2Usd: walls !== null ? walls.askDepthUsd : null,
+          cvdSlope15m: row.cvdSlope15m ?? null,
+          avgTradeSizeSpike: row.avgTradeSizeSpike ?? null,
+          oiChange15m: futUsable !== null ? futUsable.oi : null,
+          fundingRatePct: futUsable !== null ? futUsable.funding : null,
+          lsRatio: futUsable !== null ? futUsable.ls : null,
+          listingAgeDays: listingAge.get(row.pair) ?? null,
+          historyBlocks: row.historyBlocks ?? null,
+          // ── V2.2 feeds (verdict layer) ──
+          btcModeOverride: btcRegime.mode,
+          wallDataAgeMs,
+          askWallAbsentMs: askAbsentMs,
+          bidWallAbsentMs: bidAbsentMs,
+        },
+        null,
+        { priorLongGo, priorShortGo },
+      );
+      // Advance the state machines (the 3 s scan IS the verdict tick).
+      const longNext = nextVerdictState(priorLong, "long", longAssess, btcRegime.mode, nowMs, dataAgeMs, liveCfg, isStable || guard.killed(nowMs));
+      const shortNext = nextVerdictState(priorShort, "short", shortAssess, btcRegime.mode, nowMs, dataAgeMs, liveCfg, isStable || guard.killed(nowMs));
+      verdictLongStates.set(row.pair, longNext);
+      verdictShortStates.set(row.pair, shortNext);
+      // Instrumentation: every state-name change lands in the change log
+      // (raw score, smoothed score, data age, first failing gate) — the
+      // stability chip and flip-ratio metrics read exactly this.
+      if (longNext.name !== (priorLong?.name ?? "inactive")) {
+        verdictChangeLog.unshift({
+          pair: row.pair,
+          side: "long",
+          at: nowMs,
+          from: priorLong?.name ?? "inactive",
+          to: longNext.name,
+          scoreSmooth: longNext.scoreSmooth,
+          rawScore: v2.longScore,
+          dataAgeMs,
+          firstFailingGate: longAssess.demoteGate,
+          reason: longNext.lastChangeReason,
+        });
+        if (verdictChangeLog.length > VERDICT_CHANGE_LOG_MAX) verdictChangeLog.length = VERDICT_CHANGE_LOG_MAX;
+      }
+      if (shortNext.name !== (priorShort?.name ?? "inactive")) {
+        verdictChangeLog.unshift({
+          pair: row.pair,
+          side: "short",
+          at: nowMs,
+          from: priorShort?.name ?? "inactive",
+          to: shortNext.name,
+          scoreSmooth: shortNext.scoreSmooth,
+          rawScore: v2.shortScore,
+          dataAgeMs,
+          firstFailingGate: shortAssess.demoteGate,
+          reason: shortNext.lastChangeReason,
+        });
+        if (verdictChangeLog.length > VERDICT_CHANGE_LOG_MAX) verdictChangeLog.length = VERDICT_CHANGE_LOG_MAX;
+      }
+      // The overlay: the state machine's verdict replaces the raw one on the
+      // wire; the stateless verdict survives in rawVerdict for shadow mode.
+      overlayVerdictState(v2, longAssess, shortAssess, longNext, shortNext, liveCfg, isStable);
+      v2.dataAgeMs = dataAgeMs;
+      row.v2 = v2;
+    }
+
+    // V2.2 — pinned emission order (audit Part B.4/B.6): GO states first,
+    // rows pinned after leaving GO/watch second, then the rest ranked by the
+    // smoothed v2 score. A visible coin can no longer be bumped out of sight
+    // by a new candidate until its pin expires.
+    rows.sort((a, b) => {
+      const rankA = verdictSortRank(a.v2?.state ?? a.v2?.shortState ?? null, nowMs);
+      const rankB = verdictSortRank(b.v2?.state ?? b.v2?.shortState ?? null, nowMs);
+      if (rankA !== rankB) return rankA - rankB;
+      const scoreA = a.v2?.state?.scoreSmooth ?? a.v2?.longScore ?? a.score;
+      const scoreB = b.v2?.state?.scoreSmooth ?? b.v2?.longScore ?? b.score;
+      return scoreB - scoreA || b.rvol - a.rvol;
+    });
+    // Keep the payload sane: full checklists + scenarios for the top 20 and
+    // subscribed pairs; scores + verdict + warnings for the long tail.
+    const detailRank = new Map<string, number>();
+    rows.forEach((r, i) => detailRank.set(r.pair, i));
+    for (const row of rows) {
+      const v2 = row.v2;
+      if (!v2) continue;
       const rank = detailRank.get(row.pair) ?? 999;
       if (rank > 20 && !subscribed.has(row.pair)) {
         v2.checks = [];
@@ -1675,7 +1814,6 @@ async function scan(): Promise<void> {
         v2.trade = null;
         v2.shortTrade = null;
       }
-      row.v2 = v2;
     }
 
     // Depth budget goes to the rows that can actually produce a GO verdict.
@@ -1694,6 +1832,7 @@ async function scan(): Promise<void> {
       scans,
       stale: bannedUntil > Date.now(),
       btc: btcContext,
+      stability: stabilityStats(verdictChangeLog, nowMs, { cadenceMs: liveCfg.scanCadenceMs }),
     };
     io.emit("radar:snapshot", lastSnapshot);
 
@@ -1780,6 +1919,7 @@ httpServer.listen(PORT, () => {
         );
         if (Array.isArray(payload) && (payload as Kline[]).length >= 16) {
           candles.set(pair, payload as Kline[]);
+          candleAt.set(pair, Date.now()); // V2.2 — verdict data-age clock
         }
       } catch {
         break; // banned or unreachable — the pump will keep trying
